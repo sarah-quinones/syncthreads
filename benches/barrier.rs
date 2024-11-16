@@ -1,7 +1,6 @@
-use core_affinity::CoreId;
 use diol::prelude::*;
 use rayon::prelude::*;
-use std::sync::atomic::AtomicUsize;
+use std::{sync::atomic::AtomicUsize, thread::Builder};
 use syncthreads::{AllocHint, AsyncBarrierInit, BarrierInit};
 
 fn sequential(bencher: Bencher, PlotArg(n): PlotArg) {
@@ -9,7 +8,7 @@ fn sequential(bencher: Bencher, PlotArg(n): PlotArg) {
 
     bencher.bench(|| {
         x.fill(1.0);
-        for i in 0..n {
+        for i in 0..n / 4 {
             let head = x[i];
 
             x[i + 1..].iter_mut().for_each(|x| {
@@ -19,12 +18,12 @@ fn sequential(bencher: Bencher, PlotArg(n): PlotArg) {
     })
 }
 
-fn rayon(bencher: Bencher, PlotArg(n): PlotArg) {
+fn rayon_iter(bencher: Bencher, PlotArg(n): PlotArg) {
     let x = &mut *vec![1.0; n];
 
     bencher.bench(|| {
         x.fill(1.0);
-        for i in 0..n {
+        for i in 0..n / 4 {
             let head = x[i];
 
             x[i + 1..].par_iter_mut().for_each(|x| {
@@ -34,13 +33,13 @@ fn rayon(bencher: Bencher, PlotArg(n): PlotArg) {
     })
 }
 
-fn rayon_chunk(bencher: Bencher, PlotArg(n): PlotArg) {
+fn rayon_iter_chunks(bencher: Bencher, PlotArg(n): PlotArg) {
     let nthreads = rayon::current_num_threads();
     let x = &mut *vec![1.0; n];
 
     bencher.bench(|| {
         x.fill(1.0);
-        for i in 0..n {
+        for i in 0..n / 4 {
             let head = x[i];
             let len = x[i + 1..].len();
 
@@ -57,7 +56,7 @@ fn rayon_chunk(bencher: Bencher, PlotArg(n): PlotArg) {
     })
 }
 
-fn barrier(bencher: Bencher, PlotArg(n): PlotArg) {
+fn barrier_rayon(bencher: Bencher, PlotArg(n): PlotArg) {
     let nthreads = rayon::current_num_threads();
     let x = &mut *vec![1.0; n];
 
@@ -70,7 +69,7 @@ fn barrier(bencher: Bencher, PlotArg(n): PlotArg) {
                 s.spawn(|_| {
                     let mut barrier = init.barrier_ref();
 
-                    for i in 0..n {
+                    for i in 0..n / 4 {
                         let Ok((head, mine)) = syncthreads::sync!(barrier, |x| {
                             let (head, x) = x[i..].split_at_mut(1);
                             (head[0], syncthreads::iter::split_mut(x, nthreads))
@@ -88,18 +87,117 @@ fn barrier(bencher: Bencher, PlotArg(n): PlotArg) {
     })
 }
 
-fn async_barrier(bencher: Bencher, PlotArg(n): PlotArg) {
+fn barrier_pool(bencher: Bencher, PlotArg(n): PlotArg) {
+    let nthreads = 6;
+    let x = &mut *vec![1.0; n];
+
+    let mut pool = syncthreads::pool::ThreadPool::new(nthreads, |_| Builder::new()).unwrap();
+
+    let mut alloc = AllocHint::default();
+
+    bencher.bench(|| {
+        x.fill(1.0);
+        let init = BarrierInit::new(
+            &mut *x,
+            nthreads,
+            core::mem::take(&mut alloc),
+            Default::default(),
+        );
+
+        pool.all().broadcast(|_| {
+            let mut barrier = init.barrier_ref();
+
+            for i in 0..n / 4 {
+                let Ok((head, mine)) = syncthreads::sync!(barrier, |x| {
+                    let (head, x) = x[i..].split_at_mut(1);
+                    (head[0], syncthreads::iter::split_mut(x, nthreads))
+                }) else {
+                    break;
+                };
+
+                for x in mine.iter_mut() {
+                    *x += head;
+                }
+            }
+        });
+
+        alloc = init.into_inner().1;
+    })
+}
+
+fn barrier_pool_fork(bencher: Bencher, PlotArg(n): PlotArg) {
+    let nthreads = 12;
+    let mut x = &mut *vec![1.0; n];
+    let mut y = &mut *vec![1.0; n];
+
+    let mut pool = syncthreads::pool::ThreadPool::new(nthreads, |_| Builder::new()).unwrap();
+
+    bencher.bench(|| {
+        pool.all().fork2(
+            &[6, 6],
+            |group| {
+                let nthreads = group.num_threads();
+                x.fill(1.0);
+                let init =
+                    BarrierInit::new(&mut x, nthreads, Default::default(), Default::default());
+
+                group.broadcast(|_| {
+                    let mut barrier = init.barrier_ref();
+
+                    for i in 0..n / 4 {
+                        if i % 2 == 0 {
+                            continue;
+                        }
+                        let Ok((head, mine)) = syncthreads::sync!(barrier, |x| {
+                            let (head, x) = x[i..].split_at_mut(1);
+                            (head[0], syncthreads::iter::split_mut(x, nthreads))
+                        }) else {
+                            break;
+                        };
+
+                        for x in mine.iter_mut() {
+                            *x += head;
+                        }
+                    }
+                });
+            },
+            |group| {
+                let nthreads = group.num_threads();
+                y.fill(1.0);
+                let init =
+                    BarrierInit::new(&mut y, nthreads, Default::default(), Default::default());
+
+                group.broadcast(|_| {
+                    let mut barrier = init.barrier_ref();
+
+                    for i in 0..n / 4 {
+                        if i % 2 == 1 {
+                            continue;
+                        }
+                        let Ok((head, mine)) = syncthreads::sync!(barrier, |x| {
+                            let (head, x) = x[i..].split_at_mut(1);
+                            (head[0], syncthreads::iter::split_mut(x, nthreads))
+                        }) else {
+                            break;
+                        };
+
+                        for x in mine.iter_mut() {
+                            *x += head;
+                        }
+                    }
+                });
+            },
+        );
+    })
+}
+
+fn barrier_tokio(bencher: Bencher, PlotArg(n): PlotArg) {
     let nthreads = rayon::current_num_threads();
 
     static TID: AtomicUsize = AtomicUsize::new(0);
     TID.store(0, std::sync::atomic::Ordering::Relaxed);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(nthreads)
-        .on_thread_start(|| {
-            core_affinity::set_for_current(CoreId {
-                id: TID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            });
-        })
         .build()
         .unwrap();
 
@@ -113,7 +211,7 @@ fn async_barrier(bencher: Bencher, PlotArg(n): PlotArg) {
                 scope.spawn(async {
                     let mut barrier = init.barrier_ref();
 
-                    for i in 0..n {
+                    for i in 0..n / 4 {
                         let (head, mine) = syncthreads::sync!(barrier, |x| {
                             let (head, x) = x[i..].split_at_mut(1);
                             (head[0], syncthreads::iter::split_mut(x, nthreads))
@@ -133,17 +231,25 @@ fn async_barrier(bencher: Bencher, PlotArg(n): PlotArg) {
 
 fn main() -> std::io::Result<()> {
     rayon::ThreadPoolBuilder::new()
-        .start_handler(|tid| {
-            core_affinity::set_for_current(CoreId { id: tid });
-        })
-        .num_threads(core_affinity::get_core_ids().unwrap().len())
+        .num_threads(6)
         .build_global()
         .unwrap();
 
     let mut bench = Bench::new(BenchConfig::from_args()?);
     bench.register_many(
-        list![sequential, rayon, rayon_chunk, barrier, async_barrier],
-        [10_000, 100_000, 400_000].map(PlotArg),
+        list![
+            sequential,
+            barrier_pool,
+            barrier_rayon,
+            barrier_tokio,
+            rayon_iter,
+            rayon_iter_chunks,
+        ],
+        [10, 100, 1000, 10_000, 100_000, 400_000].map(PlotArg),
+    );
+    bench.register_many(
+        list![barrier_pool_fork],
+        [10, 100, 1000, 10_000, 100_000, 400_000].map(PlotArg),
     );
     bench.run()?;
 

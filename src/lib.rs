@@ -65,9 +65,15 @@ pub mod iter;
 /// Low level synchronization primitives.
 pub mod sync;
 
+pub mod pool;
+
+mod backoff;
+
 mod dyn_vec;
 use dyn_vec::DynVec;
-use sync::{AsyncBarrierParams, BarrierParams};
+#[cfg(feature = "async")]
+use sync::AsyncBarrierParams;
+use sync::BarrierParams;
 
 /// Error indicating that one of the barriers in a group was dropped while the others are still
 /// waiting.
@@ -104,6 +110,7 @@ pub struct Barrier<'a, T> {
     tag: &'a UnsafeCell<pretty::TypeId>,
 }
 /// Structure used to initialize instances of [`AsyncBarrier`].
+#[cfg(feature = "async")]
 #[derive(Debug)]
 pub struct AsyncBarrierInit<T> {
     inner: sync::AsyncBarrierInit,
@@ -116,6 +123,7 @@ pub struct AsyncBarrierInit<T> {
 
 /// Synchronous barrier for cooperation between multiple independent tasks.
 #[derive(Debug)]
+#[cfg(feature = "async")]
 pub struct AsyncBarrier<'a, T> {
     inner: sync::AsyncBarrierRef<'a>,
     data: &'a UnsafeCell<T>,
@@ -130,9 +138,13 @@ unsafe impl<T: Sync + Send> Send for BarrierInit<T> {}
 unsafe impl<T: Sync + Send> Sync for Barrier<'_, T> {}
 unsafe impl<T: Sync + Send> Send for Barrier<'_, T> {}
 
+#[cfg(feature = "async")]
 unsafe impl<T: Sync + Send> Sync for AsyncBarrierInit<T> {}
+#[cfg(feature = "async")]
 unsafe impl<T: Sync + Send> Send for AsyncBarrierInit<T> {}
+#[cfg(feature = "async")]
 unsafe impl<T: Sync + Send> Sync for AsyncBarrier<'_, T> {}
+#[cfg(feature = "async")]
 unsafe impl<T: Sync + Send> Send for AsyncBarrier<'_, T> {}
 
 pub struct Shared<T> {
@@ -319,6 +331,7 @@ impl<T> BarrierInit<T> {
     }
 }
 
+#[cfg(feature = "async")]
 impl<T> AsyncBarrierInit<T> {
     /// Creates a new [`AsyncBarrierInit`] protecting the given value, with the specified number of
     /// threads.
@@ -454,6 +467,7 @@ impl<'a, T> Barrier<'a, T> {
     }
 }
 
+#[cfg(feature = "async")]
 impl<'a, T> AsyncBarrier<'a, T> {
     /// Waits until `self.num_threads()` threads have called this function, at which point the last
     /// thread to arrive will call `f` with a reference to the data, splitting it into a shared
@@ -670,6 +684,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "async")]
     fn oversubscription() {
         use rayon::prelude::*;
 
@@ -814,6 +829,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "async")]
     fn test_tokio() {
         static TID: AtomicUsize = AtomicUsize::new(0);
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -828,6 +844,7 @@ mod tests {
         with_runtime(&runtime);
     }
 
+    #[cfg(feature = "async")]
     fn with_runtime(runtime: &tokio::runtime::Runtime) {
         let nthreads = 3;
 
@@ -867,6 +884,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "async")]
     fn test_pollster() {
         let nthreads = rayon::current_num_threads();
 
@@ -903,6 +921,7 @@ mod tests {
 
     #[test]
     #[should_panic]
+    #[cfg(feature = "async")]
     fn test_branchy() {
         let nthreads = rayon::current_num_threads();
 

@@ -12,15 +12,17 @@ use std::{
     thread::{Builder, JoinHandle, Thread},
 };
 
-use crossbeam::utils::Backoff;
+use crossbeam::utils::{Backoff, CachePadded};
 
 struct FnDataCommon {
-    parent: Thread,
     f: *const (),
-    jobs_left: AtomicUsize,
+    jobs_left: CachePadded<AtomicUsize>,
     panic_slot: AtomicPtr<()>,
 }
 struct FnDataPerWorkerInner {
+    subgroup_size: usize,
+    jobs_left_in_subgroup: *const AtomicUsize,
+    parent: Option<Thread>,
     return_slot: *mut (),
     tid: usize,
     batch: *mut [Worker],
@@ -90,9 +92,12 @@ impl ThreadPool {
                 let job_data = Arc::new(AtomicPtr::new(null_mut()));
                 let worker_data =
                     Arc::new(FnDataPerWorker(UnsafeCell::new(FnDataPerWorkerInner {
+                        subgroup_size: 0,
                         return_slot: null_mut(),
+                        parent: None,
                         tid,
                         batch: &mut [],
+                        jobs_left_in_subgroup: null_mut(),
                     })));
 
                 Ok(Worker {
@@ -115,14 +120,24 @@ impl ThreadPool {
                                     let f = core::mem::transmute::<*mut (), FnType>(f);
                                     job_fn.store(null_mut(), Ordering::Relaxed);
 
-                                    let parent = data.parent.clone();
                                     f(data, worker_data);
 
-                                    let jobs_left =
-                                        data.jobs_left.fetch_sub(1, Ordering::Release) - 1;
-                                    if jobs_left == 0 {
-                                        parent.unpark();
+                                    let jobs_left_in_subgroup = (*worker_data
+                                        .jobs_left_in_subgroup)
+                                        .fetch_sub(1, Ordering::AcqRel)
+                                        - 1;
+
+                                    if jobs_left_in_subgroup == 0 {
+                                        let jobs_left = data.jobs_left.fetch_sub(
+                                            worker_data.subgroup_size,
+                                            Ordering::Release,
+                                        ) - worker_data.subgroup_size;
+
+                                        if jobs_left == 0 {
+                                            worker_data.parent.as_ref().unwrap().unpark();
+                                        }
                                     }
+
                                     backoff.reset();
                                 } else {
                                     if backoff.is_completed() {
@@ -182,6 +197,27 @@ impl ThreadGroup {
 
         let mut v = Vec::with_capacity(n_groups);
 
+        let subgroup_size = {
+            let mut subgroup_size = 1;
+            while subgroup_size * subgroup_size <= n_groups {
+                subgroup_size *= 2;
+            }
+            subgroup_size / 2
+        };
+        let mut waits = (0..n_groups.div_ceil(subgroup_size))
+            .map(|_| CachePadded::new(AtomicUsize::new(0)))
+            .collect::<Vec<_>>();
+
+        let mut count = 0;
+        let mut idx = 0;
+        while count < n_groups {
+            waits[idx] =
+                CachePadded::new(AtomicUsize::new(Ord::min(n_groups - count, subgroup_size)));
+
+            count += subgroup_size;
+            idx += 1;
+        }
+
         let uninit = v.as_mut_ptr() as *mut MaybeUninit<R>;
 
         let workers = &mut self.workers;
@@ -190,14 +226,20 @@ impl ThreadGroup {
         let mut panic_storage = MaybeUninit::<Box<dyn Any + Send>>::uninit();
 
         let data = FnDataCommon {
-            parent: std::thread::current(),
             f: f as *const F as *const (),
-            jobs_left: AtomicUsize::new(n_groups),
+            jobs_left: CachePadded::new(AtomicUsize::new(n_groups)),
             panic_slot: AtomicPtr::new((&mut panic_storage) as *mut _ as *mut ()),
         };
+        let parent = std::thread::current();
 
         unsafe {
+            let mut subgroup = 0;
+
             for k in 1..n_groups {
+                if k % subgroup_size == 0 {
+                    subgroup += 1;
+                }
+
                 let (leader, workers_) = workers.split_first_mut().unwrap();
                 let (batch, workers_) = workers_.split_at_mut(group_sizes.next().unwrap() - 1);
 
@@ -208,6 +250,17 @@ impl ThreadGroup {
                 inner.tid = k;
                 inner.return_slot = uninit.add(k) as *mut ();
                 inner.batch = batch;
+                inner.subgroup_size = if subgroup + 1 == waits.len() {
+                    if n_groups % subgroup_size == 0 {
+                        subgroup_size
+                    } else {
+                        n_groups % subgroup_size
+                    }
+                } else {
+                    subgroup_size
+                };
+                inner.jobs_left_in_subgroup = &*waits[subgroup];
+                inner.parent = Some(parent.clone());
 
                 let f = (|data: &FnDataCommon, per_worker: &mut FnDataPerWorkerInner| {
                     match std::panic::catch_unwind(|| {
@@ -249,7 +302,10 @@ impl ThreadGroup {
                     }
                 }
             };
-            data.jobs_left.fetch_sub(1, Ordering::Release);
+            let jobs_left_in_subgroup = waits[0].fetch_sub(1, Ordering::AcqRel) - 1;
+            if jobs_left_in_subgroup == 0 {
+                data.jobs_left.fetch_sub(subgroup_size, Ordering::Release);
+            }
         }
 
         let backoff = Backoff::new();
@@ -257,6 +313,7 @@ impl ThreadGroup {
             if data.jobs_left.load(Ordering::Acquire) == 0 {
                 break;
             }
+
             if backoff.is_completed() {
                 std::thread::park();
             } else {

@@ -125,6 +125,35 @@ fn barrier_pool(bencher: Bencher, PlotArg(n): PlotArg) {
     })
 }
 
+fn barrier_pool2(bencher: Bencher, PlotArg(n): PlotArg) {
+    let nthreads = 6;
+    let x = &mut *vec![1.0; n];
+
+    let mut pool = syncthreads::pool::ThreadPool::new(nthreads, |_| Builder::new()).unwrap();
+
+    bencher.bench(|| {
+        x.fill(1.0);
+
+        for i in 0..n / 4 {
+            let init = BarrierInit::new(&mut *x, nthreads, Default::default(), Default::default());
+            pool.all().broadcast(|_| {
+                let mut barrier = init.barrier_ref();
+
+                let Ok((head, mine)) = syncthreads::sync!(barrier, |x| {
+                    let (head, x) = x[i..].split_at_mut(1);
+                    (head[0], syncthreads::iter::split_mut(x, nthreads))
+                }) else {
+                    return;
+                };
+
+                for x in mine.iter_mut() {
+                    *x += head;
+                }
+            });
+        }
+    })
+}
+
 fn barrier_pool_fork(bencher: Bencher, PlotArg(n): PlotArg) {
     let nthreads = 12;
     let mut x = &mut *vec![1.0; n];
@@ -240,6 +269,7 @@ fn main() -> std::io::Result<()> {
         list![
             sequential,
             barrier_pool,
+            barrier_pool2,
             barrier_rayon,
             barrier_tokio,
             rayon_iter,

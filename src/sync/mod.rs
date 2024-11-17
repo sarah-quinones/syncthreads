@@ -26,6 +26,31 @@ struct AtomicCounter {
     sublevel: Vec<AtomicCounter>,
 }
 
+#[derive(Debug)]
+struct AtomicWait {
+    counter: Vec<CachePadded<AtomicU32>>,
+}
+
+impl AtomicWait {
+    fn new(nthreads: usize) -> Self {
+        Self {
+            counter: (0..nthreads)
+                .map(|_| CachePadded::new(AtomicU32::new(0)))
+                .collect(),
+        }
+    }
+
+    fn wait(&self, tid: usize) {
+        atomic_wait::wait(&self.counter[tid], 1);
+    }
+
+    fn wake_all(&self) {
+        for c in &self.counter {
+            atomic_wait::wake_all(&**c);
+        }
+    }
+}
+
 impl AtomicCounter {
     fn new(nthreads: usize) -> Self {
         for k in [4, 3, 2] {
@@ -38,12 +63,10 @@ impl AtomicCounter {
             }
         }
 
-        {
-            Self {
-                counter: CachePadded::new(AtomicUsize::new(nthreads)),
-                max: nthreads,
-                sublevel: vec![],
-            }
+        Self {
+            counter: CachePadded::new(AtomicUsize::new(nthreads)),
+            max: nthreads,
+            sublevel: vec![],
         }
     }
 
@@ -72,7 +95,7 @@ pub struct BarrierInit {
     count: AtomicCounter,
     max: usize,
 
-    parking: AtomicU32,
+    parking: AtomicWait,
     limit: SpinLimit,
 }
 
@@ -99,7 +122,7 @@ impl BarrierInit {
             gsense: CachePadded::new(AtomicBool::new(false)),
             max: num_threads,
 
-            parking: AtomicU32::new(0),
+            parking: AtomicWait::new(num_threads),
             limit,
         }
     }
@@ -140,7 +163,7 @@ macro_rules! impl_barrier {
                     self.init.gsense.store(self.lsense, SeqCst);
 
                     if cfg!(miri) {
-                        atomic_wait::wake_all(atomic);
+                        atomic.wake_all();
                     } else {
                         unsafe {
                             parking_lot_core::unpark_all(
@@ -163,7 +186,7 @@ macro_rules! impl_barrier {
                         }
                         if wait.is_completed() {
                             if cfg!(miri) {
-                                atomic_wait::wait(atomic, 1);
+                                atomic.wait(self.tid);
                             } else {
                                 unsafe {
                                     parking_lot_core::park(
@@ -193,7 +216,7 @@ macro_rules! impl_barrier {
                 let addr = unsafe { core::mem::transmute::<_, usize>(addr as *const BarrierInit) };
 
                 if cfg!(miri) {
-                    atomic_wait::wake_all(atomic);
+                    atomic.wake_all();
                 } else {
                     unsafe {
                         parking_lot_core::unpark_all(addr, parking_lot_core::DEFAULT_UNPARK_TOKEN);
@@ -211,7 +234,7 @@ macro_rules! impl_barrier {
                 while self.init.waiting_for_leader.load(SeqCst) {
                     if wait.is_completed() {
                         if cfg!(miri) {
-                            atomic_wait::wait(atomic, 1);
+                            atomic.wait(self.tid);
                         } else {
                             unsafe {
                                 parking_lot_core::park(

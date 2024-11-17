@@ -219,6 +219,10 @@ fn barrier_pool_fork(bencher: Bencher, PlotArg(n): PlotArg) {
 }
 
 fn main() -> std::io::Result<()> {
+    // rayon::ThreadPoolBuilder::new()
+    //     .num_threads(128)
+    //     .build_global()
+    //     .unwrap();
     dbg!(rayon::current_num_threads());
     dbg!(SpinLimit::best(rayon::current_num_threads()));
 

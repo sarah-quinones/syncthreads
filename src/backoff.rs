@@ -285,13 +285,32 @@ pub fn best_limit_bench(nthreads: usize) -> SpinLimit {
     let mut best = 0;
     let mut time = std::time::Duration::from_nanos(u64::MAX);
 
-    for limit in 0..10 {
+    let mut n_iters = 1;
+    loop {
+        let now = std::time::Instant::now();
+        let init = crate::sync::BarrierInit::new(nthreads, SpinLimit(0));
+
+        pool.all().broadcast(|tid| {
+            let mut barrier = init.barrier_ref(tid);
+            for _ in 0..n_iters {
+                barrier.wait();
+            }
+        });
+
+        let delta = now.elapsed();
+        if delta > std::time::Duration::from_millis(1) {
+            break;
+        }
+        n_iters *= 2;
+    }
+
+    for limit in 0..20 {
         let now = std::time::Instant::now();
         let init = crate::sync::BarrierInit::new(nthreads, SpinLimit(limit));
 
         pool.all().broadcast(|tid| {
             let mut barrier = init.barrier_ref(tid);
-            for _ in 0..4096 {
+            for _ in 0..32 {
                 barrier.wait();
             }
         });
@@ -300,6 +319,9 @@ pub fn best_limit_bench(nthreads: usize) -> SpinLimit {
         if delta < time {
             time = delta;
             best = limit;
+        }
+        if delta > std::time::Duration::from_millis(10) {
+            break;
         }
     }
     SpinLimit(best)

@@ -1,7 +1,7 @@
 use diol::prelude::*;
 use rayon::prelude::*;
 use std::thread::Builder;
-use syncthreads::{AllocHint, BarrierInit};
+use syncthreads::{AllocHint, BarrierInit, SpinLimit};
 
 fn sequential(bencher: Bencher, PlotArg(n): PlotArg) {
     let x = &mut *vec![1.0; n];
@@ -58,11 +58,13 @@ fn rayon_iter_chunks(bencher: Bencher, PlotArg(n): PlotArg) {
 
 fn barrier_rayon(bencher: Bencher, PlotArg(n): PlotArg) {
     let nthreads = rayon::current_num_threads();
+    let limit = SpinLimit::best(nthreads);
+
     let x = &mut *vec![1.0; n];
 
     bencher.bench(|| {
         x.fill(1.0);
-        let init = BarrierInit::new(&mut *x, nthreads, AllocHint::default());
+        let init = BarrierInit::new(&mut *x, nthreads, AllocHint::default(), limit);
 
         rayon::in_place_scope(|s| {
             for _ in 0..nthreads {
@@ -89,6 +91,7 @@ fn barrier_rayon(bencher: Bencher, PlotArg(n): PlotArg) {
 
 fn barrier_pool(bencher: Bencher, PlotArg(n): PlotArg) {
     let nthreads = rayon::current_num_threads();
+    let limit = SpinLimit::best(nthreads);
     let x = &mut *vec![1.0; n];
 
     let mut pool = syncthreads::pool::ThreadPool::new(nthreads, |_| Builder::new()).unwrap();
@@ -97,7 +100,7 @@ fn barrier_pool(bencher: Bencher, PlotArg(n): PlotArg) {
 
     bencher.bench(|| {
         x.fill(1.0);
-        let init = BarrierInit::new(&mut *x, nthreads, core::mem::take(&mut alloc));
+        let init = BarrierInit::new(&mut *x, nthreads, core::mem::take(&mut alloc), limit);
 
         pool.all().broadcast(|_| {
             let mut barrier = init.barrier_ref();
@@ -122,6 +125,7 @@ fn barrier_pool(bencher: Bencher, PlotArg(n): PlotArg) {
 
 fn barrier_pool2(bencher: Bencher, PlotArg(n): PlotArg) {
     let nthreads = rayon::current_num_threads();
+    let limit = SpinLimit::best(nthreads);
     let x = &mut *vec![1.0; n];
 
     let mut pool = syncthreads::pool::ThreadPool::new(nthreads, |_| Builder::new()).unwrap();
@@ -130,7 +134,7 @@ fn barrier_pool2(bencher: Bencher, PlotArg(n): PlotArg) {
         x.fill(1.0);
 
         for i in 0..Ord::min(n, Ord::max(16, n / 64)) {
-            let init = BarrierInit::new(&mut *x, nthreads, Default::default());
+            let init = BarrierInit::new(&mut *x, nthreads, Default::default(), limit);
             pool.all().broadcast(|_| {
                 let mut barrier = init.barrier_ref();
 
@@ -151,6 +155,7 @@ fn barrier_pool2(bencher: Bencher, PlotArg(n): PlotArg) {
 
 fn barrier_pool_fork(bencher: Bencher, PlotArg(n): PlotArg) {
     let nthreads = 2 * rayon::current_num_threads();
+    let limit = SpinLimit::best(nthreads);
     let mut x = &mut *vec![1.0; n];
     let mut y = &mut *vec![1.0; n];
 
@@ -162,7 +167,7 @@ fn barrier_pool_fork(bencher: Bencher, PlotArg(n): PlotArg) {
             |group| {
                 let nthreads = group.num_threads();
                 x.fill(1.0);
-                let init = BarrierInit::new(&mut x, nthreads, Default::default());
+                let init = BarrierInit::new(&mut x, nthreads, Default::default(), limit);
 
                 group.broadcast(|_| {
                     let mut barrier = init.barrier_ref();
@@ -187,7 +192,7 @@ fn barrier_pool_fork(bencher: Bencher, PlotArg(n): PlotArg) {
             |group| {
                 let nthreads = group.num_threads();
                 y.fill(1.0);
-                let init = BarrierInit::new(&mut y, nthreads, Default::default());
+                let init = BarrierInit::new(&mut y, nthreads, Default::default(), limit);
 
                 group.broadcast(|_| {
                     let mut barrier = init.barrier_ref();
@@ -214,10 +219,8 @@ fn barrier_pool_fork(bencher: Bencher, PlotArg(n): PlotArg) {
 }
 
 fn main() -> std::io::Result<()> {
-    // rayon::ThreadPoolBuilder::new()
-    //     .num_threads(64)
-    //     .build_global()
-    //     .unwrap();
+    dbg!(rayon::current_num_threads());
+    dbg!(SpinLimit::best(rayon::current_num_threads()));
 
     let mut bench = Bench::new(BenchConfig::from_args()?);
     bench.register_many(

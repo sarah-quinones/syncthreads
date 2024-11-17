@@ -1,26 +1,86 @@
-use alloc::sync::Arc;
+use crate::backoff::Backoff;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+use crossbeam::utils::CachePadded;
 use std::sync::atomic::AtomicU32;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct SpinLimit(pub u32);
+
+impl SpinLimit {
+    pub fn best(num_threads: usize) -> Self {
+        crate::backoff::best_limit_bench(num_threads)
+    }
+}
+
+impl Default for SpinLimit {
+    #[inline]
+    fn default() -> Self {
+        Self(4)
+    }
+}
+
+#[derive(Debug)]
+struct AtomicCounter {
+    counter: CachePadded<AtomicUsize>,
+    max: usize,
+    sublevel: Vec<AtomicCounter>,
+}
+
+impl AtomicCounter {
+    fn new(nthreads: usize) -> Self {
+        for k in [4, 3, 2] {
+            if nthreads % k == 0 {
+                return Self {
+                    counter: CachePadded::new(AtomicUsize::new(k)),
+                    max: k,
+                    sublevel: (0..k).map(|_| Self::new(nthreads / k)).collect(),
+                };
+            }
+        }
+
+        {
+            Self {
+                counter: CachePadded::new(AtomicUsize::new(nthreads)),
+                max: nthreads,
+                sublevel: vec![],
+            }
+        }
+    }
+
+    fn dec(&self, tid: usize, nthreads: usize) -> bool {
+        let k = self.sublevel.len();
+
+        if k == 0 || self.sublevel[(tid * k) / nthreads].dec(tid % (nthreads / k), nthreads / k) {
+            return self.counter.fetch_sub(1, SeqCst) == 1;
+        }
+        false
+    }
+
+    fn reset(&self) {
+        self.counter.store(self.max, SeqCst);
+        for c in &self.sublevel {
+            c.reset();
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct BarrierInit {
     done: AtomicBool,
-    waiting_for_leader: AtomicBool,
-    gsense: AtomicBool,
-    count: AtomicUsize,
+    waiting_for_leader: CachePadded<AtomicBool>,
+    gsense: CachePadded<AtomicBool>,
+    count: AtomicCounter,
     max: usize,
 
     parking: AtomicU32,
+    limit: SpinLimit,
 }
-#[derive(Debug)]
-pub struct Barrier {
-    init: Arc<BarrierInit>,
-    lsense: bool,
-}
+
 #[derive(Debug)]
 pub struct BarrierRef<'a> {
     init: &'a BarrierInit,
     lsense: bool,
+    tid: usize,
 }
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BarrierWaitResult {
@@ -31,15 +91,16 @@ pub enum BarrierWaitResult {
 
 impl BarrierInit {
     #[inline]
-    pub fn new(num_threads: usize) -> Self {
+    pub fn new(num_threads: usize, limit: SpinLimit) -> Self {
         Self {
             done: AtomicBool::new(false),
-            waiting_for_leader: AtomicBool::new(false),
-            count: AtomicUsize::new(num_threads),
-            gsense: AtomicBool::new(false),
+            waiting_for_leader: CachePadded::new(AtomicBool::new(false)),
+            count: AtomicCounter::new(num_threads),
+            gsense: CachePadded::new(AtomicBool::new(false)),
             max: num_threads,
 
             parking: AtomicU32::new(0),
+            limit,
         }
     }
 
@@ -48,14 +109,13 @@ impl BarrierInit {
         self.max
     }
 
-    pub fn barrier(self: Arc<Self>) -> Barrier {
+    pub fn barrier_ref(&self, tid: usize) -> BarrierRef<'_> {
         let lsense = false;
-        Barrier { init: self, lsense }
-    }
-
-    pub fn barrier_ref(&self) -> BarrierRef<'_> {
-        let lsense = false;
-        BarrierRef { init: self, lsense }
+        BarrierRef {
+            init: self,
+            lsense,
+            tid,
+        }
     }
 }
 
@@ -74,10 +134,9 @@ macro_rules! impl_barrier {
                 let addr = unsafe { core::mem::transmute::<_, usize>(addr as *const BarrierInit) };
                 let atomic = &self.init.parking;
 
-                if (self.init.count.fetch_sub(1, SeqCst)) == 1 {
-                    let max = self.init.max;
+                if self.init.count.dec(self.tid, self.init.max) {
                     self.init.waiting_for_leader.store(true, SeqCst);
-                    self.init.count.store(max, SeqCst);
+                    self.init.count.reset();
                     self.init.gsense.store(self.lsense, SeqCst);
 
                     if cfg!(miri) {
@@ -92,7 +151,7 @@ macro_rules! impl_barrier {
                     }
                     BarrierWaitResult::Leader
                 } else {
-                    let wait = crossbeam::utils::Backoff::new();
+                    let wait = Backoff::new(self.init.limit.0);
                     loop {
                         let done = self.init.done.load(SeqCst);
                         let keep_going = self.init.gsense.load(SeqCst) != self.lsense;
@@ -148,7 +207,7 @@ macro_rules! impl_barrier {
                 let addr: &BarrierInit = &*self.init;
                 let addr = unsafe { core::mem::transmute::<_, usize>(addr as *const BarrierInit) };
 
-                let wait = crossbeam::utils::Backoff::new();
+                let wait = Backoff::new(self.init.limit.0);
                 while self.init.waiting_for_leader.load(SeqCst) {
                     if wait.is_completed() {
                         if cfg!(miri) {
@@ -174,5 +233,4 @@ macro_rules! impl_barrier {
     };
 }
 
-impl_barrier!(Barrier);
 impl_barrier!(BarrierRef<'_>);

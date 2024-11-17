@@ -57,6 +57,7 @@ use core::{cell::UnsafeCell, fmt, sync::atomic::AtomicUsize};
 use crossbeam::utils::CachePadded;
 use equator::assert;
 use std::sync::atomic::AtomicBool;
+pub use sync::SpinLimit;
 
 extern crate alloc;
 
@@ -235,9 +236,9 @@ impl Default for Alloc {
 impl<T> BarrierInit<T> {
     /// Creates a new [`BarrierInit`] protecting the given value, with the specified number of
     /// threads.
-    pub fn new(value: T, num_threads: usize, hint: AllocHint) -> Self {
+    pub fn new(value: T, num_threads: usize, hint: AllocHint, limit: SpinLimit) -> Self {
         BarrierInit {
-            inner: sync::BarrierInit::new(num_threads),
+            inner: sync::BarrierInit::new(num_threads, limit),
             data: UnsafeCell::new(value),
             shared: UnsafeCell::new(hint.shared.make_vec()),
             exclusive: UnsafeCell::new(hint.exclusive.make_vec()),
@@ -275,7 +276,7 @@ impl<T> BarrierInit<T> {
         let tid = self.tid.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         assert!(tid < self.num_threads());
         Barrier {
-            inner: self.inner.barrier_ref(),
+            inner: self.inner.barrier_ref(tid),
             data: &self.data,
             shared: &self.shared,
             exclusive: &self.exclusive,
@@ -433,7 +434,7 @@ mod tests {
         for _ in 0..SAMPLES {
             let now = std::time::Instant::now();
             for _ in 0..ITERS {
-                let init = BarrierInit::new(&mut *x, nthreads, default());
+                let init = BarrierInit::new(&mut *x, nthreads, default(), default());
                 std::thread::scope(|s| {
                     for _ in 0..nthreads {
                         s.spawn(|| {
@@ -478,7 +479,7 @@ mod tests {
             for _ in 0..ITERS {
                 let x = &mut *vec![1.0; n];
                 let nthreads = rayon::current_num_threads();
-                let init = BarrierInit::new(&mut *x, nthreads, default());
+                let init = BarrierInit::new(&mut *x, nthreads, default(), default());
                 threadpool_scope::scope_with(&pool, |scope| {
                     for _ in 0..nthreads {
                         scope.execute(|| {
@@ -520,7 +521,7 @@ mod tests {
             let now = std::time::Instant::now();
             for _ in 0..ITERS {
                 let x = &mut *vec![1.0; n];
-                let init = BarrierInit::new(&mut *x, nthreads, default());
+                let init = BarrierInit::new(&mut *x, nthreads, default(), default());
                 pool.in_place_scope(|s| {
                     for _ in 0..nthreads {
                         s.spawn(|_| {

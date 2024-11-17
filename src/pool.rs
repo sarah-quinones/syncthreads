@@ -12,7 +12,8 @@ use std::{
     thread::{Builder, JoinHandle, Thread},
 };
 
-use crossbeam::utils::{Backoff, CachePadded};
+use crate::backoff::Backoff;
+use crossbeam::utils::CachePadded;
 
 struct FnDataCommon {
     f: *const (),
@@ -78,7 +79,7 @@ impl Drop for ThreadPool {
 }
 
 impl ThreadPool {
-    pub fn new_imp(
+    fn new_imp(
         nthreads: usize,
         builder: &mut dyn FnMut(usize) -> Builder,
     ) -> Result<Self, std::io::Error> {
@@ -105,7 +106,7 @@ impl ThreadPool {
                     job_data: job_data.clone(),
                     worker_data: worker_data.clone(),
                     handle: builder(tid).spawn(move || {
-                        let backoff = Backoff::new();
+                        let backoff = Backoff::new(4);
                         loop {
                             if dropped.load(Ordering::Relaxed) {
                                 break;
@@ -308,7 +309,7 @@ impl ThreadGroup {
             }
         }
 
-        let backoff = Backoff::new();
+        let backoff = Backoff::new(4);
         loop {
             if data.jobs_left.load(Ordering::Acquire) == 0 {
                 break;
@@ -390,7 +391,12 @@ mod tests {
         let n = 10;
         let x = &mut *vec![1.0; n];
         x.fill(1.0);
-        let init = BarrierInit::new(&mut *x, nthreads, AllocHint::default());
+        let init = BarrierInit::new(
+            &mut *x,
+            nthreads,
+            AllocHint::default(),
+            sync::SpinLimit::best(nthreads),
+        );
 
         pool.all().broadcast(|_| {
             let mut barrier = init.barrier_ref();

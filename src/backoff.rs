@@ -298,7 +298,7 @@ pub fn best_limit_bench(nthreads: usize) -> SpinLimit {
         });
 
         let delta = now.elapsed();
-        if delta > std::time::Duration::from_millis(1) {
+        if delta > std::time::Duration::from_millis(10) {
             break;
         }
         n_iters *= 2;
@@ -320,7 +320,7 @@ pub fn best_limit_bench(nthreads: usize) -> SpinLimit {
             time = delta;
             best = limit;
         }
-        if delta > std::time::Duration::from_millis(10) {
+        if delta > std::time::Duration::from_millis(50) {
             break;
         }
     }

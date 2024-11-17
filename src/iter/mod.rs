@@ -1,40 +1,48 @@
-/// Iterator obtained from [`split`].
-pub struct Split<'a, T> {
+use core::mem::take;
+
+/// Iterator obtained from [`partition`].
+pub struct Partition<'a, T> {
     slice: &'a [T],
     div: usize,
+    rem: usize,
     count: usize,
 }
 
-/// Iterator obtained from [`split_mut`].
-pub struct SplitMut<'a, T> {
+/// Iterator obtained from [`partition_mut`].
+pub struct PartitionMut<'a, T> {
     slice: &'a mut [T],
     div: usize,
+    rem: usize,
     count: usize,
 }
 
 /// Returns an iterator producing `chunk_count` contiguous slices of `slice`.
 #[inline]
-pub fn split<T>(slice: &[T], chunk_count: usize) -> Split<'_, T> {
-    let div = slice.len().div_ceil(chunk_count);
-    Split {
+pub fn partition<T>(slice: &[T], chunk_count: usize) -> Partition<'_, T> {
+    let div = slice.len() / chunk_count;
+    let rem = slice.len() % chunk_count;
+    Partition {
         slice,
         div,
+        rem,
         count: chunk_count,
     }
 }
 
 /// Returns an iterator producing `chunk_count` contiguous slices of `slice`.
 #[inline]
-pub fn split_mut<T>(slice: &mut [T], chunk_count: usize) -> SplitMut<'_, T> {
-    let div = slice.len().div_ceil(chunk_count);
-    SplitMut {
+pub fn partition_mut<T>(slice: &mut [T], chunk_count: usize) -> PartitionMut<'_, T> {
+    let div = slice.len() / chunk_count;
+    let rem = slice.len() % chunk_count;
+    PartitionMut {
         slice,
         div,
+        rem,
         count: chunk_count,
     }
 }
 
-impl<'a, T> Iterator for SplitMut<'a, T> {
+impl<'a, T> Iterator for PartitionMut<'a, T> {
     type Item = &'a mut [T];
 
     #[inline]
@@ -42,10 +50,12 @@ impl<'a, T> Iterator for SplitMut<'a, T> {
         if self.count == 0 {
             None
         } else {
-            let len = self.slice.len();
             let next;
-            (next, self.slice) =
-                core::mem::take(&mut self.slice).split_at_mut(Ord::min(self.div, len));
+
+            let bonus = (self.rem > 0) as usize;
+            (next, self.slice) = take(&mut self.slice).split_at_mut(self.div + bonus);
+            self.rem -= bonus;
+
             self.count -= 1;
             Some(next)
         }
@@ -57,7 +67,7 @@ impl<'a, T> Iterator for SplitMut<'a, T> {
     }
 }
 
-impl<'a, T> Iterator for Split<'a, T> {
+impl<'a, T> Iterator for Partition<'a, T> {
     type Item = &'a [T];
 
     #[inline]
@@ -65,9 +75,12 @@ impl<'a, T> Iterator for Split<'a, T> {
         if self.count == 0 {
             None
         } else {
-            let len = self.slice.len();
             let next;
-            (next, self.slice) = core::mem::take(&mut self.slice).split_at(Ord::min(self.div, len));
+
+            let bonus = (self.rem > 0) as usize;
+            (next, self.slice) = take(&mut self.slice).split_at(self.div + bonus);
+            self.rem -= bonus;
+
             self.count -= 1;
             Some(next)
         }
@@ -79,7 +92,7 @@ impl<'a, T> Iterator for Split<'a, T> {
     }
 }
 
-impl<'a, T> DoubleEndedIterator for SplitMut<'a, T> {
+impl<'a, T> DoubleEndedIterator for PartitionMut<'a, T> {
     #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.count == 0 {
@@ -87,15 +100,17 @@ impl<'a, T> DoubleEndedIterator for SplitMut<'a, T> {
         } else {
             let len = self.slice.len();
             let next;
-            (self.slice, next) =
-                core::mem::take(&mut self.slice).split_at_mut(len - Ord::min(self.div, len));
+
+            let bonus = (self.count == self.rem) as usize;
+            (self.slice, next) = take(&mut self.slice).split_at_mut(len - (self.div + bonus));
+
             self.count -= 1;
             Some(next)
         }
     }
 }
 
-impl<'a, T> DoubleEndedIterator for Split<'a, T> {
+impl<'a, T> DoubleEndedIterator for Partition<'a, T> {
     #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.count == 0 {
@@ -103,22 +118,24 @@ impl<'a, T> DoubleEndedIterator for Split<'a, T> {
         } else {
             let len = self.slice.len();
             let next;
-            (self.slice, next) =
-                core::mem::take(&mut self.slice).split_at(len - Ord::min(self.div, len));
+
+            let bonus = (self.count == self.rem) as usize;
+            (self.slice, next) = take(&mut self.slice).split_at(len - (self.div + bonus));
+
             self.count -= 1;
             Some(next)
         }
     }
 }
 
-impl<'a, T> ExactSizeIterator for SplitMut<'a, T> {
+impl<'a, T> ExactSizeIterator for PartitionMut<'a, T> {
     #[inline]
     fn len(&self) -> usize {
         self.count
     }
 }
 
-impl<'a, T> ExactSizeIterator for Split<'a, T> {
+impl<'a, T> ExactSizeIterator for Partition<'a, T> {
     #[inline]
     fn len(&self) -> usize {
         self.count

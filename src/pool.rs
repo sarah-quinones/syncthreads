@@ -398,7 +398,7 @@ mod tests {
             for i in 0..n {
                 let Ok((head, mine)) = sync!(barrier, |x| {
                     let (head, x) = x[i..].split_at_mut(1);
-                    (head[0], crate::iter::split_mut(x, nthreads))
+                    (head[0], crate::iter::partition_mut(x, nthreads))
                 }) else {
                     return;
                 };

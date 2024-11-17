@@ -35,7 +35,7 @@
 //!                 let (head, mine) = sync!(barrier, |x| {
 //!                     let (head, x) = x[i..].split_at_mut(1);
 //!
-//!                     (head[0], iter::split_mut(x, nthreads))
+//!                     (head[0], iter::partition_mut(x, nthreads))
 //!                 })
 //!                 .unwrap();
 //!
@@ -623,7 +623,7 @@ mod tests {
                                 let Ok((head, mine)) = sync!(barrier, |x| {
                                     let (head, x) = x[i..].split_at_mut(1);
 
-                                    (head[0], iter::split_mut(x, nthreads))
+                                    (head[0], iter::partition_mut(x, nthreads))
                                 }) else {
                                     panic!();
                                 };
@@ -667,7 +667,7 @@ mod tests {
                             for i in 0..n / 2 {
                                 let Ok((&head, mine)) = sync!(barrier, |x| {
                                     let (head, x) = x[i..].split_at_mut(1);
-                                    (head[0], iter::split_mut(x, nthreads))
+                                    (head[0], iter::partition_mut(x, nthreads))
                                 }) else {
                                     panic!();
                                 };
@@ -764,7 +764,7 @@ mod tests {
                             for i in 0..n / 2 {
                                 let Ok((head, mine)) = sync!(barrier, |x| {
                                     let (head, x) = x[i..].split_at_mut(1);
-                                    (head[0], iter::split_mut(x, nthreads))
+                                    (head[0], iter::partition_mut(x, nthreads))
                                 }) else {
                                     panic!();
                                 };
@@ -864,7 +864,7 @@ mod tests {
                             for i in 0..n / 2 {
                                 let Ok((head, mine)) = sync!(barrier, |x| {
                                     let (head, x) = x[i..].split_at_mut(1);
-                                    (head[0], iter::split_mut(x, nthreads))
+                                    (head[0], iter::partition_mut(x, nthreads))
                                 })
                                 .await
                                 else {
@@ -902,7 +902,7 @@ mod tests {
                     for i in 0..n / 2 {
                         let Ok((head, mine)) = sync!(barrier, |x| {
                             let (head, x) = x[i..].split_at_mut(1);
-                            (head[0], iter::split_mut(x, nthreads))
+                            (head[0], iter::partition_mut(x, nthreads))
                         })
                         .await
                         else {
@@ -940,7 +940,7 @@ mod tests {
                         if barrier.thread_id() == 0 {
                             let Ok((head, mine)) = sync!(barrier, |x| {
                                 let (head, x) = x[i..].split_at_mut(1);
-                                (head[0], iter::split_mut(x, nthreads))
+                                (head[0], iter::partition_mut(x, nthreads))
                             })
                             .await
                             else {
@@ -953,7 +953,7 @@ mod tests {
                         } else {
                             let Ok((head, mine)) = sync!(barrier, |x| {
                                 let (head, x) = x[i..].split_at_mut(1);
-                                (head[0], iter::split_mut(x, nthreads))
+                                (head[0], iter::partition_mut(x, nthreads))
                             })
                             .await
                             else {

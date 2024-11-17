@@ -72,7 +72,7 @@ fn barrier_rayon(bencher: Bencher, PlotArg(n): PlotArg) {
                     for i in 0..n / 4 {
                         let Ok((head, mine)) = syncthreads::sync!(barrier, |x| {
                             let (head, x) = x[i..].split_at_mut(1);
-                            (head[0], syncthreads::iter::split_mut(x, nthreads))
+                            (head[0], syncthreads::iter::partition_mut(x, nthreads))
                         }) else {
                             break;
                         };
@@ -110,7 +110,7 @@ fn barrier_pool(bencher: Bencher, PlotArg(n): PlotArg) {
             for i in 0..n / 4 {
                 let Ok((head, mine)) = syncthreads::sync!(barrier, |x| {
                     let (head, x) = x[i..].split_at_mut(1);
-                    (head[0], syncthreads::iter::split_mut(x, nthreads))
+                    (head[0], syncthreads::iter::partition_mut(x, nthreads))
                 }) else {
                     break;
                 };
@@ -141,7 +141,7 @@ fn barrier_pool2(bencher: Bencher, PlotArg(n): PlotArg) {
 
                 let Ok((head, mine)) = syncthreads::sync!(barrier, |x| {
                     let (head, x) = x[i..].split_at_mut(1);
-                    (head[0], syncthreads::iter::split_mut(x, nthreads))
+                    (head[0], syncthreads::iter::partition_mut(x, nthreads))
                 }) else {
                     return;
                 };
@@ -179,7 +179,7 @@ fn barrier_pool_fork(bencher: Bencher, PlotArg(n): PlotArg) {
                         }
                         let Ok((head, mine)) = syncthreads::sync!(barrier, |x| {
                             let (head, x) = x[i..].split_at_mut(1);
-                            (head[0], syncthreads::iter::split_mut(x, nthreads))
+                            (head[0], syncthreads::iter::partition_mut(x, nthreads))
                         }) else {
                             break;
                         };
@@ -205,7 +205,7 @@ fn barrier_pool_fork(bencher: Bencher, PlotArg(n): PlotArg) {
                         }
                         let Ok((head, mine)) = syncthreads::sync!(barrier, |x| {
                             let (head, x) = x[i..].split_at_mut(1);
-                            (head[0], syncthreads::iter::split_mut(x, nthreads))
+                            (head[0], syncthreads::iter::partition_mut(x, nthreads))
                         }) else {
                             break;
                         };
@@ -243,7 +243,7 @@ fn barrier_tokio(bencher: Bencher, PlotArg(n): PlotArg) {
                     for i in 0..n / 4 {
                         let (head, mine) = syncthreads::sync!(barrier, |x| {
                             let (head, x) = x[i..].split_at_mut(1);
-                            (head[0], syncthreads::iter::split_mut(x, nthreads))
+                            (head[0], syncthreads::iter::partition_mut(x, nthreads))
                         })
                         .await
                         .unwrap();

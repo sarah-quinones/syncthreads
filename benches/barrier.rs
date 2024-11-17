@@ -88,7 +88,7 @@ fn barrier_rayon(bencher: Bencher, PlotArg(n): PlotArg) {
 }
 
 fn barrier_pool(bencher: Bencher, PlotArg(n): PlotArg) {
-    let nthreads = 6;
+    let nthreads = rayon::current_num_threads();
     let x = &mut *vec![1.0; n];
 
     let mut pool = syncthreads::pool::ThreadPool::new(nthreads, |_| Builder::new()).unwrap();
@@ -126,7 +126,7 @@ fn barrier_pool(bencher: Bencher, PlotArg(n): PlotArg) {
 }
 
 fn barrier_pool2(bencher: Bencher, PlotArg(n): PlotArg) {
-    let nthreads = 6;
+    let nthreads = rayon::current_num_threads();
     let x = &mut *vec![1.0; n];
 
     let mut pool = syncthreads::pool::ThreadPool::new(nthreads, |_| Builder::new()).unwrap();
@@ -155,7 +155,7 @@ fn barrier_pool2(bencher: Bencher, PlotArg(n): PlotArg) {
 }
 
 fn barrier_pool_fork(bencher: Bencher, PlotArg(n): PlotArg) {
-    let nthreads = 12;
+    let nthreads = 2 * rayon::current_num_threads();
     let mut x = &mut *vec![1.0; n];
     let mut y = &mut *vec![1.0; n];
 
@@ -163,7 +163,7 @@ fn barrier_pool_fork(bencher: Bencher, PlotArg(n): PlotArg) {
 
     bencher.bench(|| {
         pool.all().fork2(
-            &[6, 6],
+            &[rayon::current_num_threads(), rayon::current_num_threads()],
             |group| {
                 let nthreads = group.num_threads();
                 x.fill(1.0);
@@ -259,11 +259,6 @@ fn barrier_tokio(bencher: Bencher, PlotArg(n): PlotArg) {
 }
 
 fn main() -> std::io::Result<()> {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(6)
-        .build_global()
-        .unwrap();
-
     let mut bench = Bench::new(BenchConfig::from_args()?);
     bench.register_many(
         list![

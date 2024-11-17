@@ -830,7 +830,7 @@ dependencies = [
 
 [[package]]
 name = "syncthreads"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "aligned-vec",
  "atomic-wait",

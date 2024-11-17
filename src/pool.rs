@@ -106,7 +106,7 @@ impl ThreadPool {
                     job_data: job_data.clone(),
                     worker_data: worker_data.clone(),
                     handle: builder(tid).spawn(move || {
-                        let backoff = Backoff::new(4);
+                        let backoff = Backoff::new(6, 10, nthreads as u32);
                         loop {
                             if dropped.load(Ordering::Relaxed) {
                                 break;
@@ -310,7 +310,7 @@ impl ThreadGroup {
             }
         }
 
-        let backoff = Backoff::new(4);
+        let backoff = Backoff::new(6, 10, self.num_threads() as u32);
         loop {
             if data.jobs_left.load(Ordering::Acquire) == 0 {
                 break;
@@ -392,7 +392,7 @@ mod tests {
         let n = 10;
         let x = &mut *vec![1.0; n];
         x.fill(1.0);
-        let init = BarrierInit::new(&mut *x, nthreads, AllocHint::default(), sync::SpinLimit(5));
+        let init = BarrierInit::new(&mut *x, nthreads, AllocHint::default(), Default::default());
 
         pool.all().broadcast(|_| {
             let mut barrier = init.barrier_ref();

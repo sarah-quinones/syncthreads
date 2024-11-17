@@ -58,7 +58,7 @@ fn rayon_iter_chunks(bencher: Bencher, PlotArg(n): PlotArg) {
 
 fn barrier_rayon(bencher: Bencher, PlotArg(n): PlotArg) {
     let nthreads = rayon::current_num_threads();
-    let limit = SpinLimit::best(nthreads);
+    let limit = syncthreads::autotune(nthreads);
 
     let x = &mut *vec![1.0; n];
 
@@ -91,7 +91,7 @@ fn barrier_rayon(bencher: Bencher, PlotArg(n): PlotArg) {
 
 fn barrier_pool(bencher: Bencher, PlotArg(n): PlotArg) {
     let nthreads = rayon::current_num_threads();
-    let limit = SpinLimit::best(nthreads);
+    let limit = syncthreads::autotune(nthreads);
     let x = &mut *vec![1.0; n];
 
     let mut pool = syncthreads::pool::ThreadPool::new(nthreads, |_| Builder::new()).unwrap();
@@ -125,7 +125,7 @@ fn barrier_pool(bencher: Bencher, PlotArg(n): PlotArg) {
 
 fn barrier_pool2(bencher: Bencher, PlotArg(n): PlotArg) {
     let nthreads = rayon::current_num_threads();
-    let limit = SpinLimit::best(nthreads);
+    let limit = syncthreads::autotune(nthreads);
     let x = &mut *vec![1.0; n];
 
     let mut pool = syncthreads::pool::ThreadPool::new(nthreads, |_| Builder::new()).unwrap();
@@ -155,7 +155,7 @@ fn barrier_pool2(bencher: Bencher, PlotArg(n): PlotArg) {
 
 fn barrier_pool_fork(bencher: Bencher, PlotArg(n): PlotArg) {
     let nthreads = 2 * rayon::current_num_threads();
-    let limit = SpinLimit::best(nthreads);
+    let limit = syncthreads::autotune(nthreads);
     let mut x = &mut *vec![1.0; n];
     let mut y = &mut *vec![1.0; n];
 
@@ -219,29 +219,24 @@ fn barrier_pool_fork(bencher: Bencher, PlotArg(n): PlotArg) {
 }
 
 fn main() -> std::io::Result<()> {
-    // rayon::ThreadPoolBuilder::new()
-    //     .num_threads(6)
-    //     .build_global()
-    //     .unwrap();
     dbg!(rayon::current_num_threads());
-    dbg!(SpinLimit::best(rayon::current_num_threads()));
+    dbg!(syncthreads::autotune(rayon::current_num_threads()));
 
     let mut bench = Bench::new(BenchConfig::from_args()?);
     bench.register_many(
         list![
             sequential,
             barrier_pool,
-            barrier_pool2,
-            barrier_rayon,
-            rayon_iter,
+            // barrier_pool2,
+            // barrier_rayon,
             rayon_iter_chunks,
         ],
         [10, 100, 1000, 10_000, 100_000, 400_000].map(PlotArg),
     );
-    bench.register_many(
-        list![barrier_pool_fork],
-        [10, 100, 1000, 10_000, 100_000, 400_000].map(PlotArg),
-    );
+    // bench.register_many(
+    //     list![barrier_pool_fork],
+    //     [10, 100, 1000, 10_000, 100_000, 400_000].map(PlotArg),
+    // );
     bench.run()?;
 
     Ok(())

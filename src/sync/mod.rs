@@ -5,17 +5,19 @@ use std::sync::atomic::AtomicU32;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct SpinLimit(pub u32);
-
-impl SpinLimit {
-    pub fn best(num_threads: usize) -> Self {
-        crate::backoff::best_limit_bench(num_threads)
-    }
-}
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct YieldLimit(pub u32);
 
 impl Default for SpinLimit {
     #[inline]
     fn default() -> Self {
-        Self(4)
+        Self(6)
+    }
+}
+impl Default for YieldLimit {
+    #[inline]
+    fn default() -> Self {
+        Self(10)
     }
 }
 
@@ -70,7 +72,8 @@ pub struct BarrierInit {
     count: AtomicCounter,
     max: usize,
 
-    limit: SpinLimit,
+    spin_limit: SpinLimit,
+    yield_limit: YieldLimit,
 }
 
 #[derive(Debug)]
@@ -88,7 +91,12 @@ pub enum BarrierWaitResult {
 
 impl BarrierInit {
     #[inline]
-    pub fn new(num_threads: usize, limit: SpinLimit) -> Self {
+    pub fn autotune(num_threads: usize) -> (SpinLimit, YieldLimit) {
+        crate::backoff::best_limit_bench(num_threads)
+    }
+
+    #[inline]
+    pub fn new(num_threads: usize, spin_limit: SpinLimit, yield_limit: YieldLimit) -> Self {
         Self {
             done: AtomicBool::new(false),
             waiting_for_leader: CachePadded::new(AtomicU32::new(false as u32)),
@@ -96,7 +104,8 @@ impl BarrierInit {
             gsense: CachePadded::new(AtomicU32::new(false as u32)),
             max: num_threads,
 
-            limit,
+            spin_limit,
+            yield_limit,
         }
     }
 
@@ -133,7 +142,11 @@ impl BarrierRef<'_> {
 
             BarrierWaitResult::Leader
         } else {
-            let wait = Backoff::new(self.init.limit.0);
+            let wait = Backoff::new(
+                self.init.spin_limit.0,
+                self.init.yield_limit.0,
+                self.init.max as u32,
+            );
 
             loop {
                 let done = self.init.done.load(Acquire);
@@ -164,7 +177,11 @@ impl BarrierRef<'_> {
 
     #[inline(never)]
     pub fn follow(&self) {
-        let wait = Backoff::new(self.init.limit.0);
+        let wait = Backoff::new(
+            self.init.spin_limit.0,
+            self.init.yield_limit.0,
+            self.init.max as u32,
+        );
 
         loop {
             if self.init.waiting_for_leader.load(Acquire) == 0 {

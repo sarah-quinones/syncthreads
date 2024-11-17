@@ -1,4 +1,4 @@
-use crate::sync::SpinLimit;
+use crate::sync::{SpinLimit, YieldLimit};
 use core::{cell::Cell, fmt};
 use std::hint;
 
@@ -79,6 +79,7 @@ pub struct Backoff {
     step: Cell<u32>,
     spin_limit: u32,
     yield_limit: u32,
+    nthreads: u32,
 }
 
 impl Backoff {
@@ -92,11 +93,12 @@ impl Backoff {
     /// let backoff = Backoff::new();
     /// ```
     #[inline]
-    pub fn new(limit: u32) -> Self {
+    pub fn new(spin_limit: u32, yield_limit: u32, nthreads: u32) -> Self {
         Backoff {
             step: Cell::new(0),
-            spin_limit: limit,
-            yield_limit: limit,
+            spin_limit,
+            yield_limit,
+            nthreads,
         }
     }
 
@@ -149,7 +151,7 @@ impl Backoff {
     /// ```
     #[inline]
     pub fn spin(&self) {
-        for _ in 0..1 << self.step.get().min(self.spin_limit) {
+        for _ in 0..(1 << self.step.get()).min(self.nthreads.saturating_mul(4)) {
             hint::spin_loop();
         }
 
@@ -210,7 +212,7 @@ impl Backoff {
     #[inline]
     pub fn snooze(&self) {
         if self.step.get() <= self.spin_limit {
-            for _ in 0..1 << self.step.get() {
+            for _ in 0..(1 << self.step.get()).min(self.nthreads.saturating_mul(4)) {
                 hint::spin_loop();
             }
         } else {
@@ -279,50 +281,74 @@ impl fmt::Debug for Backoff {
     }
 }
 
-pub fn best_limit_bench(nthreads: usize) -> SpinLimit {
+pub fn best_limit_bench(nthreads: usize) -> (SpinLimit, YieldLimit) {
     let mut pool = crate::pool::ThreadPool::new(nthreads, |_| std::thread::Builder::new()).unwrap();
 
-    let mut best = 0;
-    let mut time = std::time::Duration::from_nanos(u64::MAX);
+    let min_time = std::time::Duration::from_millis(10);
+    let max_time = 5 * min_time;
 
-    let mut n_iters = 1;
-    loop {
-        let now = std::time::Instant::now();
-        let init = crate::sync::BarrierInit::new(nthreads, SpinLimit(0));
+    let mut n_iters = 2;
 
+    let mut work = |n_iters: usize, spin_limit: SpinLimit, yield_limit: YieldLimit| {
+        let init = crate::sync::BarrierInit::new(nthreads, spin_limit, yield_limit);
         pool.all().broadcast(|tid| {
             let mut barrier = init.barrier_ref(tid);
             for _ in 0..n_iters {
                 barrier.wait();
+                for _ in 0..1024 {
+                    hint::spin_loop();
+                }
             }
         });
+    };
+
+    loop {
+        let now = std::time::Instant::now();
+
+        work(n_iters, SpinLimit(6), YieldLimit(10));
 
         let delta = now.elapsed();
-        if delta > std::time::Duration::from_millis(10) {
+        if delta > min_time {
             break;
         }
         n_iters *= 2;
     }
+    n_iters /= 2;
+
+    let mut best = 0;
+    let mut time = std::time::Duration::from_nanos(u64::MAX);
 
     for limit in 0..20 {
         let now = std::time::Instant::now();
-        let init = crate::sync::BarrierInit::new(nthreads, SpinLimit(limit));
-
-        pool.all().broadcast(|tid| {
-            let mut barrier = init.barrier_ref(tid);
-            for _ in 0..32 {
-                barrier.wait();
-            }
-        });
+        work(n_iters, SpinLimit(limit), YieldLimit(10));
 
         let delta = now.elapsed();
         if delta < time {
             time = delta;
             best = limit;
         }
-        if delta > std::time::Duration::from_millis(50) {
+        if delta > max_time {
             break;
         }
     }
-    SpinLimit(best)
+    let spin_limit = SpinLimit(best);
+
+    let mut best = 0;
+    let mut time = std::time::Duration::from_nanos(u64::MAX);
+    for limit in spin_limit.0..40 {
+        let now = std::time::Instant::now();
+        work(n_iters, spin_limit, YieldLimit(limit));
+
+        let delta = now.elapsed();
+        if delta < time {
+            time = delta;
+            best = limit;
+        }
+        if delta > max_time {
+            break;
+        }
+    }
+
+    let yield_limit = YieldLimit(best);
+    (spin_limit, yield_limit)
 }

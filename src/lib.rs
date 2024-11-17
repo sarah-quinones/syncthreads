@@ -57,7 +57,7 @@ use core::{cell::UnsafeCell, fmt, sync::atomic::AtomicUsize};
 use crossbeam::utils::CachePadded;
 use equator::assert;
 use std::sync::atomic::AtomicBool;
-pub use sync::SpinLimit;
+pub use sync::{SpinLimit, YieldLimit};
 
 extern crate alloc;
 
@@ -233,12 +233,21 @@ impl Default for Alloc {
     }
 }
 
+pub fn autotune(num_threads: usize) -> (SpinLimit, YieldLimit) {
+    sync::BarrierInit::autotune(num_threads)
+}
+
 impl<T> BarrierInit<T> {
     /// Creates a new [`BarrierInit`] protecting the given value, with the specified number of
     /// threads.
-    pub fn new(value: T, num_threads: usize, hint: AllocHint, limit: SpinLimit) -> Self {
+    pub fn new(
+        value: T,
+        num_threads: usize,
+        hint: AllocHint,
+        params: (SpinLimit, YieldLimit),
+    ) -> Self {
         BarrierInit {
-            inner: sync::BarrierInit::new(num_threads, limit),
+            inner: sync::BarrierInit::new(num_threads, params.0, params.1),
             data: UnsafeCell::new(value),
             shared: UnsafeCell::new(hint.shared.make_vec()),
             exclusive: UnsafeCell::new(hint.exclusive.make_vec()),

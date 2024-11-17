@@ -151,7 +151,8 @@ impl Backoff {
     /// ```
     #[inline]
     pub fn spin(&self) {
-        for _ in 0..(1 << self.step.get()).min(self.nthreads.saturating_mul(4)) {
+        for _ in 0..(1 << self.step.get()).min(self.nthreads.saturating_mul(8).next_power_of_two())
+        {
             hint::spin_loop();
         }
 
@@ -212,7 +213,9 @@ impl Backoff {
     #[inline]
     pub fn snooze(&self) {
         if self.step.get() <= self.spin_limit {
-            for _ in 0..(1 << self.step.get()).min(self.nthreads.saturating_mul(4)) {
+            for _ in
+                0..(1 << self.step.get()).min(self.nthreads.saturating_mul(8).next_power_of_two())
+            {
                 hint::spin_loop();
             }
         } else {
@@ -286,6 +289,7 @@ pub fn best_limit_bench(nthreads: usize) -> (SpinLimit, YieldLimit) {
 
     let min_time = std::time::Duration::from_millis(10);
     let max_time = 5 * min_time;
+    let n_spin = 256;
 
     let mut n_iters = 2;
 
@@ -295,7 +299,7 @@ pub fn best_limit_bench(nthreads: usize) -> (SpinLimit, YieldLimit) {
             let mut barrier = init.barrier_ref(tid);
             for _ in 0..n_iters {
                 barrier.wait();
-                for _ in 0..1024 {
+                for _ in 0..n_spin {
                     hint::spin_loop();
                 }
             }

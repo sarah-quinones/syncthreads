@@ -1,5 +1,5 @@
 use crate::backoff::Backoff;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::*};
 use crossbeam::utils::CachePadded;
 use std::sync::atomic::AtomicU32;
 
@@ -26,31 +26,6 @@ struct AtomicCounter {
     sublevel: Vec<AtomicCounter>,
 }
 
-#[derive(Debug)]
-struct AtomicWait {
-    counter: Vec<CachePadded<AtomicU32>>,
-}
-
-impl AtomicWait {
-    fn new(nthreads: usize) -> Self {
-        Self {
-            counter: (0..nthreads)
-                .map(|_| CachePadded::new(AtomicU32::new(0)))
-                .collect(),
-        }
-    }
-
-    fn wait(&self, tid: usize) {
-        atomic_wait::wait(&self.counter[tid], 1);
-    }
-
-    fn wake_all(&self) {
-        for c in &self.counter {
-            atomic_wait::wake_all(&**c);
-        }
-    }
-}
-
 impl AtomicCounter {
     fn new(nthreads: usize) -> Self {
         for k in [4, 3, 2] {
@@ -74,13 +49,13 @@ impl AtomicCounter {
         let k = self.sublevel.len();
 
         if k == 0 || self.sublevel[(tid * k) / nthreads].dec(tid % (nthreads / k), nthreads / k) {
-            return self.counter.fetch_sub(1, SeqCst) == 1;
+            return self.counter.fetch_sub(1, AcqRel) == 1;
         }
         false
     }
 
     fn reset(&self) {
-        self.counter.store(self.max, SeqCst);
+        self.counter.store(self.max, Release);
         for c in &self.sublevel {
             c.reset();
         }
@@ -90,12 +65,11 @@ impl AtomicCounter {
 #[derive(Debug)]
 pub struct BarrierInit {
     done: AtomicBool,
-    waiting_for_leader: CachePadded<AtomicBool>,
-    gsense: CachePadded<AtomicBool>,
+    waiting_for_leader: CachePadded<AtomicU32>,
+    gsense: CachePadded<AtomicU32>,
     count: AtomicCounter,
     max: usize,
 
-    parking: AtomicWait,
     limit: SpinLimit,
 }
 
@@ -117,12 +91,11 @@ impl BarrierInit {
     pub fn new(num_threads: usize, limit: SpinLimit) -> Self {
         Self {
             done: AtomicBool::new(false),
-            waiting_for_leader: CachePadded::new(AtomicBool::new(false)),
+            waiting_for_leader: CachePadded::new(AtomicU32::new(false as u32)),
             count: AtomicCounter::new(num_threads),
-            gsense: CachePadded::new(AtomicBool::new(false)),
+            gsense: CachePadded::new(AtomicU32::new(false as u32)),
             max: num_threads,
 
-            parking: AtomicWait::new(num_threads),
             limit,
         }
     }
@@ -133,127 +106,76 @@ impl BarrierInit {
     }
 
     pub fn barrier_ref(&self, tid: usize) -> BarrierRef<'_> {
-        let lsense = false;
         BarrierRef {
             init: self,
-            lsense,
+            lsense: false,
             tid,
         }
     }
 }
 
-macro_rules! impl_barrier {
-    ($bar: ty) => {
-        impl $bar {
-            #[inline]
-            pub fn num_threads(&self) -> usize {
-                self.init.max
-            }
+impl BarrierRef<'_> {
+    #[inline]
+    pub fn num_threads(&self) -> usize {
+        self.init.max
+    }
 
-            #[inline(never)]
-            pub fn wait(&mut self) -> BarrierWaitResult {
-                self.lsense = !self.lsense;
-                let addr: &BarrierInit = &*self.init;
-                let addr = unsafe { core::mem::transmute::<_, usize>(addr as *const BarrierInit) };
-                let atomic = &self.init.parking;
+    #[inline(never)]
+    pub fn wait(&mut self) -> BarrierWaitResult {
+        self.lsense = !self.lsense;
 
-                if self.init.count.dec(self.tid, self.init.max) {
-                    self.init.waiting_for_leader.store(true, SeqCst);
-                    self.init.count.reset();
-                    self.init.gsense.store(self.lsense, SeqCst);
+        if self.init.count.dec(self.tid, self.init.max) {
+            self.init.waiting_for_leader.store(true as u32, Release);
+            self.init.count.reset();
+            self.init.gsense.store(self.lsense as u32, Release);
 
-                    if cfg!(miri) {
-                        atomic.wake_all();
-                    } else {
-                        unsafe {
-                            parking_lot_core::unpark_all(
-                                addr,
-                                parking_lot_core::DEFAULT_UNPARK_TOKEN,
-                            );
-                        }
-                    }
-                    BarrierWaitResult::Leader
+            atomic_wait::wake_all(&*self.init.gsense);
+
+            BarrierWaitResult::Leader
+        } else {
+            let wait = Backoff::new(self.init.limit.0);
+
+            loop {
+                let done = self.init.done.load(Acquire);
+
+                if (self.init.gsense.load(Acquire) != 0) == self.lsense {
+                    break;
+                }
+
+                if done {
+                    return BarrierWaitResult::Dropped;
+                }
+
+                if wait.is_completed() {
+                    atomic_wait::wait(&*self.init.gsense, (!self.lsense) as u32);
                 } else {
-                    let wait = Backoff::new(self.init.limit.0);
-                    loop {
-                        let done = self.init.done.load(SeqCst);
-                        let keep_going = self.init.gsense.load(SeqCst) != self.lsense;
-                        if !keep_going {
-                            break;
-                        }
-                        if done {
-                            return BarrierWaitResult::Dropped;
-                        }
-                        if wait.is_completed() {
-                            if cfg!(miri) {
-                                atomic.wait(self.tid);
-                            } else {
-                                unsafe {
-                                    parking_lot_core::park(
-                                        addr,
-                                        || self.init.gsense.load(SeqCst) != self.lsense,
-                                        || {},
-                                        |_, _| {},
-                                        parking_lot_core::DEFAULT_PARK_TOKEN,
-                                        None,
-                                    );
-                                }
-                            }
-                        } else {
-                            wait.snooze();
-                        }
-                    }
-                    BarrierWaitResult::Follower
+                    wait.snooze();
                 }
             }
+            BarrierWaitResult::Follower
+        }
+    }
 
-            #[inline]
-            pub fn lead(&self) {
-                self.init.waiting_for_leader.store(false, SeqCst);
+    #[inline]
+    pub fn lead(&self) {
+        self.init.waiting_for_leader.store(false as u32, Release);
+        atomic_wait::wake_all(&*self.init.waiting_for_leader);
+    }
 
-                let atomic = &self.init.parking;
-                let addr: &BarrierInit = &*self.init;
-                let addr = unsafe { core::mem::transmute::<_, usize>(addr as *const BarrierInit) };
+    #[inline(never)]
+    pub fn follow(&self) {
+        let wait = Backoff::new(self.init.limit.0);
 
-                if cfg!(miri) {
-                    atomic.wake_all();
-                } else {
-                    unsafe {
-                        parking_lot_core::unpark_all(addr, parking_lot_core::DEFAULT_UNPARK_TOKEN);
-                    }
-                }
+        loop {
+            if self.init.waiting_for_leader.load(Acquire) == 0 {
+                break;
             }
 
-            #[inline(never)]
-            pub fn follow(&self) {
-                let atomic = &self.init.parking;
-                let addr: &BarrierInit = &*self.init;
-                let addr = unsafe { core::mem::transmute::<_, usize>(addr as *const BarrierInit) };
-
-                let wait = Backoff::new(self.init.limit.0);
-                while self.init.waiting_for_leader.load(SeqCst) {
-                    if wait.is_completed() {
-                        if cfg!(miri) {
-                            atomic.wait(self.tid);
-                        } else {
-                            unsafe {
-                                parking_lot_core::park(
-                                    addr,
-                                    || self.init.waiting_for_leader.load(SeqCst),
-                                    || {},
-                                    |_, _| {},
-                                    parking_lot_core::DEFAULT_PARK_TOKEN,
-                                    None,
-                                );
-                            }
-                        }
-                    } else {
-                        wait.snooze();
-                    }
-                }
+            if wait.is_completed() {
+                atomic_wait::wait(&self.init.waiting_for_leader, true as u32);
+            } else {
+                wait.snooze();
             }
         }
-    };
+    }
 }
-
-impl_barrier!(BarrierRef<'_>);

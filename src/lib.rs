@@ -1,5 +1,5 @@
-//! `syncthreads` is a library providing synchronous and asynchronous barrier types.
-//! These can be constructed using [`BarrierInit`] and [`AsyncBarrierInit`].
+//! `syncthreads` is a library providing a synchronous type and dedicated threadpool.
+//! These can be constructed using [`BarrierInit`].
 //!
 //! # Example
 //! Sequential code:
@@ -71,8 +71,6 @@ mod backoff;
 
 mod dyn_vec;
 use dyn_vec::DynVec;
-#[cfg(feature = "async")]
-use sync::AsyncBarrierParams;
 
 /// Error indicating that one of the barriers in a group was dropped while the others are still
 /// waiting.
@@ -108,43 +106,11 @@ pub struct Barrier<'a, T> {
     tid: usize,
     tag: &'a UnsafeCell<pretty::TypeId>,
 }
-/// Structure used to initialize instances of [`AsyncBarrier`].
-#[cfg(feature = "async")]
-#[derive(Debug)]
-pub struct AsyncBarrierInit<T> {
-    inner: sync::AsyncBarrierInit,
-    data: UnsafeCell<T>,
-    shared: UnsafeCell<DynVec>,
-    exclusive: UnsafeCell<DynVec>,
-    tid: AtomicUsize,
-    tag: UnsafeCell<pretty::TypeId>,
-}
-
-/// Synchronous barrier for cooperation between multiple independent tasks.
-#[derive(Debug)]
-#[cfg(feature = "async")]
-pub struct AsyncBarrier<'a, T> {
-    inner: sync::AsyncBarrierRef<'a>,
-    data: &'a UnsafeCell<T>,
-    shared: &'a UnsafeCell<DynVec>,
-    exclusive: &'a UnsafeCell<DynVec>,
-    tid: usize,
-    tag: &'a UnsafeCell<pretty::TypeId>,
-}
 
 unsafe impl<T: Sync + Send> Sync for BarrierInit<T> {}
 unsafe impl<T: Sync + Send> Send for BarrierInit<T> {}
 unsafe impl<T: Sync + Send> Sync for Barrier<'_, T> {}
 unsafe impl<T: Sync + Send> Send for Barrier<'_, T> {}
-
-#[cfg(feature = "async")]
-unsafe impl<T: Sync + Send> Sync for AsyncBarrierInit<T> {}
-#[cfg(feature = "async")]
-unsafe impl<T: Sync + Send> Send for AsyncBarrierInit<T> {}
-#[cfg(feature = "async")]
-unsafe impl<T: Sync + Send> Sync for AsyncBarrier<'_, T> {}
-#[cfg(feature = "async")]
-unsafe impl<T: Sync + Send> Send for AsyncBarrier<'_, T> {}
 
 pub struct Shared<T> {
     taken: AtomicBool,
@@ -330,71 +296,6 @@ impl<T> BarrierInit<T> {
     }
 }
 
-#[cfg(feature = "async")]
-impl<T> AsyncBarrierInit<T> {
-    /// Creates a new [`AsyncBarrierInit`] protecting the given value, with the specified number of
-    /// threads.
-    pub fn new(value: T, num_threads: usize, hint: AllocHint, params: AsyncBarrierParams) -> Self {
-        AsyncBarrierInit {
-            inner: sync::AsyncBarrierInit::new(num_threads, params),
-            data: UnsafeCell::new(value),
-            shared: UnsafeCell::new(hint.shared.make_vec()),
-            exclusive: UnsafeCell::new(hint.exclusive.make_vec()),
-            tid: AtomicUsize::new(0),
-            tag: UnsafeCell::new(type_id_of_val(&())),
-        }
-    }
-
-    /// Consumes `self`, returning the protected value and the current allocation.
-    pub fn into_inner(self) -> (T, AllocHint) {
-        (
-            self.data.into_inner(),
-            AllocHint {
-                shared: Alloc::Storage(Storage {
-                    alloc: self.shared.into_inner(),
-                }),
-                exclusive: Alloc::Storage(Storage {
-                    alloc: self.exclusive.into_inner(),
-                }),
-            },
-        )
-    }
-
-    /// Returns a mutable reference to the protected value.
-    pub fn get_mut(&mut self) -> &mut T {
-        self.data.get_mut()
-    }
-
-    /// Creates a new barrier referencing `self`.
-    ///
-    /// # Panics
-    /// Panics if more than `self.thread_count()` barriers have been created since the creation of
-    /// `self`, or the last time [`Self::reset`] was called.
-    pub fn barrier_ref(&self) -> AsyncBarrier<'_, T> {
-        let tid = self.tid.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        assert!(tid < self.num_threads());
-        AsyncBarrier {
-            inner: self.inner.barrier_ref(),
-            data: &self.data,
-            shared: &self.shared,
-            exclusive: &self.exclusive,
-            tid,
-            tag: &self.tag,
-        }
-    }
-
-    /// Returns the number of tasks the barriers need to wait for.
-    #[inline]
-    pub fn num_threads(&self) -> usize {
-        self.inner.num_threads()
-    }
-
-    /// Resets the barrier initializer.
-    pub fn reset(&mut self) {
-        *self.tid.get_mut() = 0;
-    }
-}
-
 impl<'a, T> Barrier<'a, T> {
     /// Waits until `self.num_threads()` threads have called this function, at which point the last
     /// thread to arrive will call `f` with a reference to the data, splitting it into a shared
@@ -466,85 +367,6 @@ impl<'a, T> Barrier<'a, T> {
     }
 }
 
-#[cfg(feature = "async")]
-impl<'a, T> AsyncBarrier<'a, T> {
-    /// Waits until `self.num_threads()` threads have called this function, at which point the last
-    /// thread to arrive will call `f` with a reference to the data, splitting it into a shared
-    /// section and mutable section. These are respectively sent to the other threads through a
-    /// shared and exclusive reference.
-    ///
-    /// # Safety
-    /// Threads from the same group that wait at this function at the same time must agree on the
-    /// same types for `Shared`, `Exclusive`, and the type of `tag`.
-    pub async unsafe fn sync<
-        'b,
-        Shared: 'b + Sync,
-        Exclusive: 'b + Send,
-        I: IntoIterator<Item = Exclusive>,
-    >(
-        &'b mut self,
-        f: impl FnOnce(&'b mut T) -> (Shared, I),
-        tag: impl core::any::Any,
-    ) -> Result<(&'b Shared, Exclusive), DropError> {
-        let tag = type_id_of_val(&tag);
-        match self.inner.wait().await {
-            sync::AsyncBarrierWaitResult::Leader => {
-                let exclusive = unsafe { &mut *self.exclusive.get() };
-                let shared = unsafe { &mut *self.shared.get() };
-
-                let f = f(unsafe { &mut *self.data.get() });
-                shared.collect(core::iter::once(f.0));
-                let mut iter = f.1.into_iter();
-                exclusive.collect(
-                    (&mut iter)
-                        .take(self.num_threads())
-                        .map(Some)
-                        .map(UnsafeCell::new)
-                        .map(CachePadded::new),
-                );
-                assert!(all(
-                    exclusive.len == self.num_threads(),
-                    iter.next().is_none(),
-                ));
-                unsafe { *self.tag.get() = tag };
-                self.inner.lead();
-            }
-            sync::AsyncBarrierWaitResult::Follower => {
-                self.inner.follow().await;
-            }
-            sync::AsyncBarrierWaitResult::Dropped => return Err(DropError),
-        }
-
-        let self_tag = unsafe { *self.tag.get() };
-        assert!(tag == self_tag);
-
-        let shared = &unsafe { (&*self.shared.get()).assume_ref::<Shared>() }[0];
-        Ok((
-            shared,
-            (unsafe {
-                &mut *((&*self.exclusive.get())
-                    .assume_ref::<CachePadded<UnsafeCell<Option<Exclusive>>>>()[self.tid]
-                    .get())
-            })
-            .take()
-            .unwrap(),
-        ))
-    }
-
-    /// Returns the unique (among the barriers created by the same initializer) id of `self`, which
-    /// is a value between `0` and `self.num_threads()`.
-    #[inline]
-    pub fn thread_id(&self) -> usize {
-        self.tid
-    }
-
-    /// Returns the number of threads the barriers need to wait for.
-    #[inline]
-    pub fn num_threads(&self) -> usize {
-        self.inner.num_threads()
-    }
-}
-
 fn type_id_of_val<T: 'static>(_: &T) -> pretty::TypeId {
     pretty::TypeId {
         id: core::any::TypeId::of::<T>(),
@@ -552,7 +374,7 @@ fn type_id_of_val<T: 'static>(_: &T) -> pretty::TypeId {
     }
 }
 
-/// Safe wrapper around [`AsyncBarrier::sync`] and [`Barrier::sync`].
+/// Safe wrapper around [`Barrier::sync`].
 #[macro_export]
 macro_rules! sync {
     ($bar: expr, $f:expr) => {{
@@ -593,7 +415,6 @@ mod pretty {
 mod tests {
     use super::*;
     use core_affinity::CoreId;
-    use futures::future::join_all;
 
     const N: usize = 1000;
     const ITERS: usize = 1;
@@ -683,61 +504,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "async")]
-    fn oversubscription() {
-        use rayon::prelude::*;
-
-        dbg!("tokio");
-        static TID: AtomicUsize = AtomicUsize::new(0);
-        {
-            let runtime = &tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(rayon::current_num_threads())
-                .on_thread_start(|| {
-                    core_affinity::set_for_current(CoreId {
-                        id: TID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                    });
-                })
-                .build()
-                .unwrap();
-            tokio_scoped::scoped(runtime.handle()).scope(|scope| {
-                for _ in 0..rayon::current_num_threads() {
-                    scope.spawn(async move {
-                        with_runtime(runtime);
-                    });
-                }
-            });
-        }
-        dbg!("tokio");
-        (0..rayon::current_num_threads())
-            .into_par_iter()
-            .for_each(|_| {
-                let runtime = &tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(rayon::current_num_threads())
-                    .on_thread_start(|| {
-                        core_affinity::set_for_current(CoreId {
-                            id: TID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                        });
-                    })
-                    .build()
-                    .unwrap();
-                tokio_scoped::scoped(runtime.handle()).scope(|scope| {
-                    scope.spawn(async move {
-                        with_runtime(runtime);
-                    });
-                });
-            });
-
-        dbg!("rayon");
-        (0..rayon::current_num_threads())
-            .into_par_iter()
-            .for_each(|_| test_barrier_rayon());
-        dbg!("seq");
-        (0..rayon::current_num_threads())
-            .into_par_iter()
-            .for_each(|_| test_seq());
-    }
-
-    #[test]
     fn test_barrier_rayon() {
         let n = N;
         let nthreads = rayon::current_num_threads();
@@ -822,149 +588,6 @@ mod tests {
                         *x += head;
                     }
                 }
-            }
-            dbg!(now.elapsed());
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "async")]
-    fn test_tokio() {
-        static TID: AtomicUsize = AtomicUsize::new(0);
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(rayon::current_num_threads())
-            .on_thread_start(|| {
-                core_affinity::set_for_current(CoreId {
-                    id: TID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                });
-            })
-            .build()
-            .unwrap();
-        with_runtime(&runtime);
-    }
-
-    #[cfg(feature = "async")]
-    fn with_runtime(runtime: &tokio::runtime::Runtime) {
-        let nthreads = 3;
-
-        for _ in 0..SAMPLES {
-            let now = std::time::Instant::now();
-            for _ in 0..ITERS {
-                let n = N;
-                let x = &mut *vec![1.0; n];
-
-                let init =
-                    AsyncBarrierInit::new(&mut *x, nthreads, AllocHint::default(), default());
-                tokio_scoped::scoped(runtime.handle()).scope(|scope| {
-                    for _ in 0..nthreads {
-                        scope.spawn(async {
-                            let mut barrier = init.barrier_ref();
-
-                            for i in 0..n / 2 {
-                                let Ok((head, mine)) = sync!(barrier, |x| {
-                                    let (head, x) = x[i..].split_at_mut(1);
-                                    (head[0], iter::partition_mut(x, nthreads))
-                                })
-                                .await
-                                else {
-                                    panic!();
-                                };
-
-                                for x in mine.iter_mut() {
-                                    *x += head;
-                                }
-                            }
-                        });
-                    }
-                });
-            }
-            dbg!(now.elapsed());
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "async")]
-    fn test_pollster() {
-        let nthreads = rayon::current_num_threads();
-
-        for _ in 0..SAMPLES {
-            let now = std::time::Instant::now();
-            for _ in 0..ITERS {
-                let n = N;
-                let x = &mut *vec![1.0; n];
-
-                let init =
-                    AsyncBarrierInit::new(&mut *x, nthreads, AllocHint::default(), default());
-                pollster::block_on(join_all((0..nthreads).map(|_| async {
-                    let mut barrier = init.barrier_ref();
-
-                    for i in 0..n / 2 {
-                        let Ok((head, mine)) = sync!(barrier, |x| {
-                            let (head, x) = x[i..].split_at_mut(1);
-                            (head[0], iter::partition_mut(x, nthreads))
-                        })
-                        .await
-                        else {
-                            panic!();
-                        };
-
-                        for x in mine.iter_mut() {
-                            *x += head;
-                        }
-                    }
-                })));
-            }
-            dbg!(now.elapsed());
-        }
-    }
-
-    #[test]
-    #[should_panic]
-    #[cfg(feature = "async")]
-    fn test_branchy() {
-        let nthreads = rayon::current_num_threads();
-
-        for _ in 0..SAMPLES {
-            let now = std::time::Instant::now();
-            for _ in 0..ITERS {
-                let n = N;
-                let x = &mut *vec![1.0; n];
-
-                let init =
-                    AsyncBarrierInit::new(&mut *x, nthreads, AllocHint::default(), default());
-                pollster::block_on(join_all((0..nthreads).map(|_| async {
-                    let mut barrier = init.barrier_ref();
-
-                    for i in 0..n / 2 {
-                        if barrier.thread_id() == 0 {
-                            let Ok((head, mine)) = sync!(barrier, |x| {
-                                let (head, x) = x[i..].split_at_mut(1);
-                                (head[0], iter::partition_mut(x, nthreads))
-                            })
-                            .await
-                            else {
-                                panic!();
-                            };
-
-                            for x in mine.iter_mut() {
-                                *x += head;
-                            }
-                        } else {
-                            let Ok((head, mine)) = sync!(barrier, |x| {
-                                let (head, x) = x[i..].split_at_mut(1);
-                                (head[0], iter::partition_mut(x, nthreads))
-                            })
-                            .await
-                            else {
-                                panic!();
-                            };
-
-                            for x in mine.iter_mut() {
-                                *x += head;
-                            }
-                        }
-                    }
-                })));
             }
             dbg!(now.elapsed());
         }

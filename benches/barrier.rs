@@ -62,7 +62,7 @@ fn barrier_rayon(bencher: Bencher, PlotArg(n): PlotArg) {
 
     bencher.bench(|| {
         x.fill(1.0);
-        let init = BarrierInit::new(&mut *x, nthreads, AllocHint::default(), Default::default());
+        let init = BarrierInit::new(&mut *x, nthreads, AllocHint::default());
 
         rayon::in_place_scope(|s| {
             for _ in 0..nthreads {
@@ -97,12 +97,7 @@ fn barrier_pool(bencher: Bencher, PlotArg(n): PlotArg) {
 
     bencher.bench(|| {
         x.fill(1.0);
-        let init = BarrierInit::new(
-            &mut *x,
-            nthreads,
-            core::mem::take(&mut alloc),
-            Default::default(),
-        );
+        let init = BarrierInit::new(&mut *x, nthreads, core::mem::take(&mut alloc));
 
         pool.all().broadcast(|_| {
             let mut barrier = init.barrier_ref();
@@ -135,7 +130,7 @@ fn barrier_pool2(bencher: Bencher, PlotArg(n): PlotArg) {
         x.fill(1.0);
 
         for i in 0..n / 4 {
-            let init = BarrierInit::new(&mut *x, nthreads, Default::default(), Default::default());
+            let init = BarrierInit::new(&mut *x, nthreads, Default::default());
             pool.all().broadcast(|_| {
                 let mut barrier = init.barrier_ref();
 
@@ -167,8 +162,7 @@ fn barrier_pool_fork(bencher: Bencher, PlotArg(n): PlotArg) {
             |group| {
                 let nthreads = group.num_threads();
                 x.fill(1.0);
-                let init =
-                    BarrierInit::new(&mut x, nthreads, Default::default(), Default::default());
+                let init = BarrierInit::new(&mut x, nthreads, Default::default());
 
                 group.broadcast(|_| {
                     let mut barrier = init.barrier_ref();
@@ -193,8 +187,7 @@ fn barrier_pool_fork(bencher: Bencher, PlotArg(n): PlotArg) {
             |group| {
                 let nthreads = group.num_threads();
                 y.fill(1.0);
-                let init =
-                    BarrierInit::new(&mut y, nthreads, Default::default(), Default::default());
+                let init = BarrierInit::new(&mut y, nthreads, Default::default());
 
                 group.broadcast(|_| {
                     let mut barrier = init.barrier_ref();
@@ -259,6 +252,11 @@ fn barrier_tokio(bencher: Bencher, PlotArg(n): PlotArg) {
 }
 
 fn main() -> std::io::Result<()> {
+    // rayon::ThreadPoolBuilder::new()
+    //     .num_threads(12)
+    //     .build_global()
+    //     .unwrap();
+
     let mut bench = Bench::new(BenchConfig::from_args()?);
     bench.register_many(
         list![

@@ -73,7 +73,6 @@ mod dyn_vec;
 use dyn_vec::DynVec;
 #[cfg(feature = "async")]
 use sync::AsyncBarrierParams;
-use sync::BarrierParams;
 
 /// Error indicating that one of the barriers in a group was dropped while the others are still
 /// waiting.
@@ -270,9 +269,9 @@ impl Default for Alloc {
 impl<T> BarrierInit<T> {
     /// Creates a new [`BarrierInit`] protecting the given value, with the specified number of
     /// threads.
-    pub fn new(value: T, num_threads: usize, hint: AllocHint, params: BarrierParams) -> Self {
+    pub fn new(value: T, num_threads: usize, hint: AllocHint) -> Self {
         BarrierInit {
-            inner: sync::BarrierInit::new(num_threads, params),
+            inner: sync::BarrierInit::new(num_threads),
             data: UnsafeCell::new(value),
             shared: UnsafeCell::new(hint.shared.make_vec()),
             exclusive: UnsafeCell::new(hint.exclusive.make_vec()),
@@ -613,7 +612,7 @@ mod tests {
         for _ in 0..SAMPLES {
             let now = std::time::Instant::now();
             for _ in 0..ITERS {
-                let init = BarrierInit::new(&mut *x, nthreads, default(), default());
+                let init = BarrierInit::new(&mut *x, nthreads, default());
                 std::thread::scope(|s| {
                     for _ in 0..nthreads {
                         s.spawn(|| {
@@ -658,7 +657,7 @@ mod tests {
             for _ in 0..ITERS {
                 let x = &mut *vec![1.0; n];
                 let nthreads = rayon::current_num_threads();
-                let init = BarrierInit::new(&mut *x, nthreads, default(), default());
+                let init = BarrierInit::new(&mut *x, nthreads, default());
                 threadpool_scope::scope_with(&pool, |scope| {
                     for _ in 0..nthreads {
                         scope.execute(|| {
@@ -755,7 +754,7 @@ mod tests {
             let now = std::time::Instant::now();
             for _ in 0..ITERS {
                 let x = &mut *vec![1.0; n];
-                let init = BarrierInit::new(&mut *x, nthreads, default(), default());
+                let init = BarrierInit::new(&mut *x, nthreads, default());
                 pool.in_place_scope(|s| {
                     for _ in 0..nthreads {
                         s.spawn(|_| {

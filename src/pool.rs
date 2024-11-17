@@ -390,7 +390,7 @@ mod tests {
         let n = 10;
         let x = &mut *vec![1.0; n];
         x.fill(1.0);
-        let init = BarrierInit::new(&mut *x, nthreads, AllocHint::default(), Default::default());
+        let init = BarrierInit::new(&mut *x, nthreads, AllocHint::default());
 
         pool.all().broadcast(|_| {
             let mut barrier = init.barrier_ref();

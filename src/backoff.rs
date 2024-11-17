@@ -291,7 +291,7 @@ pub fn best_limit_bench(nthreads: usize) -> SpinLimit {
 
         pool.all().broadcast(|tid| {
             let mut barrier = init.barrier_ref(tid);
-            for _ in 0..1024 {
+            for _ in 0..4096 {
                 barrier.wait();
             }
         });

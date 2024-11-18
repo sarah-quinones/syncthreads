@@ -290,7 +290,7 @@ pub fn best_limit_bench(nthreads: usize, min_time: std::time::Duration) -> (Spin
 
     let min_time = min_time / 10;
     let max_time = 5 * min_time;
-    let n_spin = 32;
+    let n_spin = 128;
 
     let mut n_iters = 2;
 

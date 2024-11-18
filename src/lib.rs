@@ -79,7 +79,7 @@ mod backoff;
 mod dyn_vec;
 use dyn_vec::DynVec;
 
-pub static AUTOTUNE_DURATION_MICROS: AtomicU32 = AtomicU32::new(100_000);
+pub static AUTOTUNE_DURATION_MICROS: AtomicU32 = AtomicU32::new(1_000_000);
 pub static SPIN_LIMIT_FALLBACK: AtomicU32 = AtomicU32::new(10);
 pub static YIELD_LIMIT_FALLBACK: AtomicU32 = AtomicU32::new(20);
 

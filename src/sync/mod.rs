@@ -126,7 +126,7 @@ impl BarrierRef<'_> {
                 }
 
                 let started = self.init.started.load(Acquire);
-                let do_wait = started != 0 && started != self.init.max;
+                let do_wait = wait.is_completed() && started != 0 && started != self.init.max;
                 // let do_wait = wait.is_completed();
 
                 if do_wait {
@@ -162,7 +162,7 @@ impl BarrierRef<'_> {
 
             let followed = self.init.followed.load(Acquire);
 
-            let do_wait = followed != 0 && followed != self.init.max;
+            let do_wait = wait.is_completed() && followed != 0 && followed != self.init.max;
             // let do_wait = wait.is_completed();
 
             if do_wait {

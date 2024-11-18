@@ -95,7 +95,7 @@ fn main() -> std::io::Result<()> {
             // barrier_pool2,
             // barrier_rayon,
         ],
-        [200 * 200, 400 * 400, 1000 * 1000].map(PlotArg),
+        [200 * 200, 400 * 400, 1000 * 1000, 1500 * 1500].map(PlotArg),
     );
     // bench.register_many(
     //     list![barrier_pool_fork],

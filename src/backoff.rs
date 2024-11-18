@@ -271,6 +271,10 @@ impl Backoff {
     pub fn is_completed(&self) -> bool {
         self.step.get() > self.yield_limit
     }
+
+    pub fn step(&self) -> u32 {
+        self.step.get()
+    }
 }
 
 impl fmt::Debug for Backoff {

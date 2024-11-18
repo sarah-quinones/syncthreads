@@ -79,7 +79,7 @@ impl Drop for ThreadPool {
 }
 
 impl ThreadPool {
-    fn new_imp(
+    pub(crate) fn new_imp(
         nthreads: usize,
         builder: &mut dyn FnMut(usize) -> Builder,
     ) -> Result<Self, std::io::Error> {
@@ -162,6 +162,7 @@ impl ThreadPool {
         nthreads: usize,
         builder: impl FnMut(usize) -> Builder,
     ) -> Result<Self, std::io::Error> {
+        _ = *crate::AUTOTUNE;
         Self::new_imp(nthreads, &mut { builder })
     }
 

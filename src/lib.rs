@@ -56,7 +56,13 @@
 use core::{cell::UnsafeCell, fmt, sync::atomic::AtomicUsize};
 use crossbeam::utils::CachePadded;
 use equator::assert;
-use std::sync::atomic::AtomicBool;
+use std::{
+    sync::{
+        atomic::{AtomicBool, AtomicU32},
+        LazyLock,
+    },
+    time::Duration,
+};
 pub use sync::{SpinLimit, YieldLimit};
 
 extern crate alloc;
@@ -72,6 +78,41 @@ mod backoff;
 
 mod dyn_vec;
 use dyn_vec::DynVec;
+
+pub static AUTOTUNE_DURATION_MICROS: AtomicU32 = AtomicU32::new(100_000);
+pub static SPIN_LIMIT_FALLBACK: AtomicU32 = AtomicU32::new(10);
+pub static YIELD_LIMIT_FALLBACK: AtomicU32 = AtomicU32::new(20);
+
+pub static AUTOTUNE: LazyLock<BarrierParams> = LazyLock::new(|| {
+    let duration = AUTOTUNE_DURATION_MICROS.load(std::sync::atomic::Ordering::Relaxed) as u64;
+
+    if duration == 0 {
+        BarrierParams {
+            spin_limit: SpinLimit(SPIN_LIMIT_FALLBACK.load(std::sync::atomic::Ordering::Relaxed)),
+            yield_limit: YieldLimit(
+                YIELD_LIMIT_FALLBACK.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    } else {
+        autotune(
+            std::thread::available_parallelism().unwrap().get(),
+            std::time::Duration::from_micros(duration),
+        )
+    }
+});
+
+#[derive(Copy, Clone, Debug)]
+pub struct BarrierParams {
+    pub spin_limit: SpinLimit,
+    pub yield_limit: YieldLimit,
+}
+
+impl Default for BarrierParams {
+    #[inline]
+    fn default() -> Self {
+        *AUTOTUNE
+    }
+}
 
 /// Error indicating that one of the barriers in a group was dropped while the others are still
 /// waiting.
@@ -233,21 +274,20 @@ impl Default for Alloc {
     }
 }
 
-pub fn autotune(num_threads: usize) -> (SpinLimit, YieldLimit) {
-    sync::BarrierInit::autotune(num_threads)
+pub fn autotune(num_threads: usize, min_time: Duration) -> BarrierParams {
+    let (spin_limit, yield_limit) = backoff::best_limit_bench(num_threads, min_time);
+    BarrierParams {
+        spin_limit,
+        yield_limit,
+    }
 }
 
 impl<T> BarrierInit<T> {
     /// Creates a new [`BarrierInit`] protecting the given value, with the specified number of
     /// threads.
-    pub fn new(
-        value: T,
-        num_threads: usize,
-        hint: AllocHint,
-        params: (SpinLimit, YieldLimit),
-    ) -> Self {
+    pub fn new(value: T, num_threads: usize, hint: AllocHint, params: BarrierParams) -> Self {
         BarrierInit {
-            inner: sync::BarrierInit::new(num_threads, params.0, params.1),
+            inner: sync::BarrierInit::new(num_threads, params.spin_limit, params.yield_limit),
             data: UnsafeCell::new(value),
             shared: UnsafeCell::new(hint.shared.make_vec()),
             exclusive: UnsafeCell::new(hint.exclusive.make_vec()),

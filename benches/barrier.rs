@@ -1,7 +1,7 @@
 use diol::prelude::*;
 use rayon::prelude::*;
 use std::thread::Builder;
-use syncthreads::{AllocHint, BarrierInit, SpinLimit, YieldLimit};
+use syncthreads::{AllocHint, BarrierInit};
 
 fn n_iters(n: usize) -> usize {
     ((n as f64).sqrt()) as usize
@@ -47,8 +47,6 @@ fn rayon_iter_chunks(bencher: Bencher, PlotArg(n): PlotArg) {
 
 fn barrier_pool(bencher: Bencher, PlotArg(n): PlotArg) {
     let nthreads = rayon::current_num_threads();
-    let limit = syncthreads::autotune(nthreads);
-    // let limit = (SpinLimit(10), YieldLimit(20));
     let x = &mut *vec![1.0; n];
 
     let mut pool = syncthreads::pool::ThreadPool::new(nthreads, |_| Builder::new()).unwrap();
@@ -57,16 +55,18 @@ fn barrier_pool(bencher: Bencher, PlotArg(n): PlotArg) {
 
     bencher.bench(|| {
         x.fill(1.0);
-        let init = BarrierInit::new(&mut *x, nthreads, core::mem::take(&mut alloc), limit);
+        let init = BarrierInit::new(
+            &mut *x,
+            nthreads,
+            core::mem::take(&mut alloc),
+            Default::default(),
+        );
 
         pool.all().broadcast(|_| {
             let mut barrier = init.barrier_ref();
 
             for i in 0..n_iters(n) {
-                // syncthreads::sync::COUNTER.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-
                 let Ok((head, mine)) = syncthreads::sync!(barrier, |x| {
-                    // syncthreads::sync::COUNTER.store(0, std::sync::atomic::Ordering::Release);
                     let (head, x) = x[i..].split_at_mut(1);
                     (head[0], syncthreads::iter::partition_mut(x, nthreads))
                 }) else {
@@ -95,7 +95,7 @@ fn main() -> std::io::Result<()> {
             // barrier_pool2,
             // barrier_rayon,
         ],
-        [200 * 200, 400 * 400, 1000 * 1000, 1500 * 1500].map(PlotArg),
+        [100 * 100, 200 * 200, 400 * 400, 1000 * 1000, 1500 * 1500].map(PlotArg),
     );
     // bench.register_many(
     //     list![barrier_pool_fork],

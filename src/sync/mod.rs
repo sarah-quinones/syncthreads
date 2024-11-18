@@ -50,11 +50,6 @@ pub enum BarrierWaitResult {
 
 impl BarrierInit {
     #[inline]
-    pub fn autotune(num_threads: usize) -> (SpinLimit, YieldLimit) {
-        crate::backoff::best_limit_bench(num_threads)
-    }
-
-    #[inline]
     pub fn new(num_threads: usize, spin_limit: SpinLimit, yield_limit: YieldLimit) -> Self {
         Self {
             done: AtomicBool::new(false),
@@ -85,8 +80,6 @@ impl BarrierInit {
         }
     }
 }
-
-pub static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 impl BarrierRef<'_> {
     #[inline]

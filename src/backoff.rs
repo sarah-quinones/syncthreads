@@ -82,6 +82,7 @@ pub struct Backoff {
     nthreads: u32,
 }
 
+#[allow(dead_code)]
 impl Backoff {
     /// Creates a new `Backoff`.
     ///
@@ -271,10 +272,6 @@ impl Backoff {
     pub fn is_completed(&self) -> bool {
         self.step.get() > self.yield_limit
     }
-
-    pub fn step(&self) -> u32 {
-        self.step.get()
-    }
 }
 
 impl fmt::Debug for Backoff {
@@ -286,12 +283,14 @@ impl fmt::Debug for Backoff {
     }
 }
 
-pub fn best_limit_bench(nthreads: usize) -> (SpinLimit, YieldLimit) {
-    let mut pool = crate::pool::ThreadPool::new(nthreads, |_| std::thread::Builder::new()).unwrap();
+pub fn best_limit_bench(nthreads: usize, min_time: std::time::Duration) -> (SpinLimit, YieldLimit) {
+    // don't call ThreadPool::new to avoid recursing on AUTOTUNE
+    let mut pool =
+        crate::pool::ThreadPool::new_imp(nthreads, &mut |_| std::thread::Builder::new()).unwrap();
 
-    let min_time = std::time::Duration::from_millis(10);
+    let min_time = min_time / 10;
     let max_time = 5 * min_time;
-    let n_spin = 256;
+    let n_spin = 32;
 
     let mut n_iters = 2;
 
@@ -324,7 +323,7 @@ pub fn best_limit_bench(nthreads: usize) -> (SpinLimit, YieldLimit) {
     let mut best = 0;
     let mut time = std::time::Duration::from_nanos(u64::MAX);
 
-    for limit in 0..20 {
+    for limit in (0..20).step_by(2) {
         let now = std::time::Instant::now();
         work(n_iters, SpinLimit(limit), YieldLimit(10));
 
@@ -334,14 +333,14 @@ pub fn best_limit_bench(nthreads: usize) -> (SpinLimit, YieldLimit) {
             best = limit;
         }
         if delta > max_time {
-            break;
+            continue;
         }
     }
     let spin_limit = SpinLimit(best);
 
     let mut best = 0;
     let mut time = std::time::Duration::from_nanos(u64::MAX);
-    for limit in spin_limit.0..40 {
+    for limit in (spin_limit.0..40).step_by(2) {
         let now = std::time::Instant::now();
         work(n_iters, spin_limit, YieldLimit(limit));
 
@@ -351,7 +350,7 @@ pub fn best_limit_bench(nthreads: usize) -> (SpinLimit, YieldLimit) {
             best = limit;
         }
         if delta > max_time {
-            break;
+            continue;
         }
     }
 

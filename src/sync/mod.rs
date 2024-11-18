@@ -22,55 +22,15 @@ impl Default for YieldLimit {
 }
 
 #[derive(Debug)]
-struct AtomicCounter {
-    counter: CachePadded<AtomicUsize>,
-    max: usize,
-    sublevel: Vec<AtomicCounter>,
-}
-
-impl AtomicCounter {
-    fn new(nthreads: usize) -> Self {
-        for k in [4, 3, 2] {
-            if nthreads % k == 0 {
-                return Self {
-                    counter: CachePadded::new(AtomicUsize::new(k)),
-                    max: k,
-                    sublevel: (0..k).map(|_| Self::new(nthreads / k)).collect(),
-                };
-            }
-        }
-
-        Self {
-            counter: CachePadded::new(AtomicUsize::new(nthreads)),
-            max: nthreads,
-            sublevel: vec![],
-        }
-    }
-
-    fn dec(&self, tid: usize, nthreads: usize) -> bool {
-        let k = self.sublevel.len();
-
-        if k == 0 || self.sublevel[(tid * k) / nthreads].dec(tid % (nthreads / k), nthreads / k) {
-            return self.counter.fetch_sub(1, AcqRel) == 1;
-        }
-        false
-    }
-
-    fn reset(&self) {
-        self.counter.store(self.max, Release);
-        for c in &self.sublevel {
-            c.reset();
-        }
-    }
-}
-
-#[derive(Debug)]
 pub struct BarrierInit {
     done: AtomicBool,
     waiting_for_leader: CachePadded<AtomicU32>,
     gsense: CachePadded<AtomicU32>,
-    count: AtomicCounter,
+
     max: usize,
+    count: CachePadded<AtomicUsize>,
+    started: CachePadded<AtomicUsize>,
+    followed: CachePadded<AtomicUsize>,
 
     spin_limit: SpinLimit,
     yield_limit: YieldLimit,
@@ -80,7 +40,6 @@ pub struct BarrierInit {
 pub struct BarrierRef<'a> {
     init: &'a BarrierInit,
     lsense: bool,
-    tid: usize,
 }
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BarrierWaitResult {
@@ -100,7 +59,11 @@ impl BarrierInit {
         Self {
             done: AtomicBool::new(false),
             waiting_for_leader: CachePadded::new(AtomicU32::new(false as u32)),
-            count: AtomicCounter::new(num_threads),
+
+            count: CachePadded::new(AtomicUsize::new(num_threads)),
+            started: CachePadded::new(AtomicUsize::new(0)),
+            followed: CachePadded::new(AtomicUsize::new(0)),
+
             gsense: CachePadded::new(AtomicU32::new(false as u32)),
             max: num_threads,
 
@@ -115,13 +78,15 @@ impl BarrierInit {
     }
 
     pub fn barrier_ref(&self, tid: usize) -> BarrierRef<'_> {
+        _ = tid;
         BarrierRef {
             init: self,
             lsense: false,
-            tid,
         }
     }
 }
+
+pub static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 impl BarrierRef<'_> {
     #[inline]
@@ -133,9 +98,10 @@ impl BarrierRef<'_> {
     pub fn wait(&mut self) -> BarrierWaitResult {
         self.lsense = !self.lsense;
 
-        if self.init.count.dec(self.tid, self.init.max) {
+        if self.init.count.fetch_sub(1, AcqRel) == 1 {
+            self.init.followed.store(0, Release);
             self.init.waiting_for_leader.store(true as u32, Release);
-            self.init.count.reset();
+            self.init.count.store(self.init.max, Release);
             self.init.gsense.store(self.lsense as u32, Release);
 
             atomic_wait::wake_all(&*self.init.gsense);
@@ -159,18 +125,24 @@ impl BarrierRef<'_> {
                     return BarrierWaitResult::Dropped;
                 }
 
-                if wait.is_completed() {
+                let started = self.init.started.load(Acquire);
+                let do_wait = started != 0 && started != self.init.max;
+                // let do_wait = wait.is_completed();
+
+                if do_wait {
                     atomic_wait::wait(&*self.init.gsense, (!self.lsense) as u32);
                 } else {
                     wait.snooze();
                 }
             }
+            self.init.followed.fetch_add(1, Release);
             BarrierWaitResult::Follower
         }
     }
 
     #[inline]
     pub fn lead(&self) {
+        self.init.started.store(0, Release);
         self.init.waiting_for_leader.store(false as u32, Release);
         atomic_wait::wake_all(&*self.init.waiting_for_leader);
     }
@@ -188,11 +160,17 @@ impl BarrierRef<'_> {
                 break;
             }
 
-            if wait.is_completed() {
+            let followed = self.init.followed.load(Acquire);
+
+            let do_wait = followed != 0 && followed != self.init.max;
+            // let do_wait = wait.is_completed();
+
+            if do_wait {
                 atomic_wait::wait(&self.init.waiting_for_leader, true as u32);
             } else {
                 wait.snooze();
             }
         }
+        self.init.started.fetch_add(1, Release);
     }
 }

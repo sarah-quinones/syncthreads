@@ -151,7 +151,7 @@ impl Backoff {
     /// ```
     #[inline]
     pub fn spin(&self) {
-        for _ in 0..(1 << self.step.get()).min(self.nthreads.saturating_mul(8).next_power_of_two())
+        for _ in 0..(1 << self.step.get()).min(self.nthreads.saturating_mul(16).next_power_of_two())
         {
             hint::spin_loop();
         }
@@ -213,9 +213,7 @@ impl Backoff {
     #[inline]
     pub fn snooze(&self) {
         if self.step.get() <= self.spin_limit {
-            for _ in
-                0..(1 << self.step.get()).min(self.nthreads.saturating_mul(8).next_power_of_two())
-            {
+            for _ in 0..(1 << self.step.get()).min(self.nthreads.saturating_mul(16)) {
                 hint::spin_loop();
             }
         } else {

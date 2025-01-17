@@ -101,11 +101,7 @@ impl BarrierRef<'_> {
 
             BarrierWaitResult::Leader
         } else {
-            let wait = Backoff::new(
-                self.init.spin_limit.0,
-                self.init.yield_limit.0,
-                self.init.max as u32,
-            );
+            let wait = Backoff::new(self.init.spin_limit.0, self.init.yield_limit.0);
 
             loop {
                 let done = self.init.done.load(Acquire);
@@ -120,7 +116,6 @@ impl BarrierRef<'_> {
 
                 let started = self.init.started.load(Acquire);
                 let do_wait = wait.is_completed() && started != 0 && started != self.init.max;
-                // let do_wait = wait.is_completed();
 
                 if do_wait {
                     atomic_wait::wait(&*self.init.gsense, (!self.lsense) as u32);
@@ -142,11 +137,7 @@ impl BarrierRef<'_> {
 
     #[inline(never)]
     pub fn follow(&self) {
-        let wait = Backoff::new(
-            self.init.spin_limit.0,
-            self.init.yield_limit.0,
-            self.init.max as u32,
-        );
+        let wait = Backoff::new(self.init.spin_limit.0, self.init.yield_limit.0);
 
         loop {
             if self.init.waiting_for_leader.load(Acquire) == 0 {
@@ -156,7 +147,6 @@ impl BarrierRef<'_> {
             let followed = self.init.followed.load(Acquire);
 
             let do_wait = wait.is_completed() && followed != 0 && followed != self.init.max;
-            // let do_wait = wait.is_completed();
 
             if do_wait {
                 atomic_wait::wait(&self.init.waiting_for_leader, true as u32);
@@ -165,5 +155,11 @@ impl BarrierRef<'_> {
             }
         }
         self.init.started.fetch_add(1, Release);
+    }
+}
+
+impl Drop for BarrierRef<'_> {
+    fn drop(&mut self) {
+        self.init.done.store(true, Release);
     }
 }

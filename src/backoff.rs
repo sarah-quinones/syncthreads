@@ -79,144 +79,27 @@ pub struct Backoff {
     step: Cell<u32>,
     spin_limit: u32,
     yield_limit: u32,
-    nthreads: u32,
 }
 
 #[allow(dead_code)]
 impl Backoff {
-    /// Creates a new `Backoff`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use crossbeam_utils::Backoff;
-    ///
-    /// let backoff = Backoff::new();
-    /// ```
     #[inline]
-    pub fn new(spin_limit: u32, yield_limit: u32, nthreads: u32) -> Self {
+    pub fn new(spin_limit: u32, yield_limit: u32) -> Self {
         Backoff {
             step: Cell::new(0),
-            spin_limit,
-            yield_limit,
-            nthreads,
+            spin_limit: 1 << spin_limit,
+            yield_limit: Ord::max(1 << spin_limit, 1 << yield_limit),
         }
     }
 
-    /// Resets the `Backoff`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use crossbeam_utils::Backoff;
-    ///
-    /// let backoff = Backoff::new();
-    /// backoff.reset();
-    /// ```
-    #[inline]
     pub fn reset(&self) {
         self.step.set(0);
     }
 
-    /// Backs off in a lock-free loop.
-    ///
-    /// This method should be used when we need to retry an operation because another thread made
-    /// progress.
-    ///
-    /// The processor may yield using the *YIELD* or *PAUSE* instruction.
-    ///
-    /// # Examples
-    ///
-    /// Backing off in a lock-free loop:
-    ///
-    /// ```
-    /// use crossbeam_utils::Backoff;
-    /// use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-    ///
-    /// fn fetch_mul(a: &AtomicUsize, b: usize) -> usize {
-    ///     let backoff = Backoff::new();
-    ///     loop {
-    ///         let val = a.load(SeqCst);
-    ///         if a.compare_exchange(val, val.wrapping_mul(b), SeqCst, SeqCst)
-    ///             .is_ok()
-    ///         {
-    ///             return val;
-    ///         }
-    ///         backoff.spin();
-    ///     }
-    /// }
-    ///
-    /// let a = AtomicUsize::new(7);
-    /// assert_eq!(fetch_mul(&a, 8), 7);
-    /// assert_eq!(a.load(SeqCst), 56);
-    /// ```
-    #[inline]
-    pub fn spin(&self) {
-        for _ in 0..(1 << self.step.get()).min(self.nthreads.saturating_mul(16).next_power_of_two())
-        {
-            hint::spin_loop();
-        }
-
-        if self.step.get() <= self.spin_limit {
-            self.step.set(self.step.get() + 1);
-        }
-    }
-
-    /// Backs off in a blocking loop.
-    ///
-    /// This method should be used when we need to wait for another thread to make progress.
-    ///
-    /// The processor may yield using the *YIELD* or *PAUSE* instruction and the current thread
-    /// may yield by giving up a timeslice to the OS scheduler.
-    ///
-    /// In `#[no_std]` environments, this method is equivalent to [`spin`].
-    ///
-    /// If possible, use [`is_completed`] to check when it is advised to stop using backoff and
-    /// block the current thread using a different synchronization mechanism instead.
-    ///
-    /// [`spin`]: Backoff::spin
-    /// [`is_completed`]: Backoff::is_completed
-    ///
-    /// # Examples
-    ///
-    /// Waiting for an [`AtomicBool`] to become `true`:
-    ///
-    /// ```
-    /// use crossbeam_utils::Backoff;
-    /// use std::sync::Arc;
-    /// use std::sync::atomic::AtomicBool;
-    /// use std::sync::atomic::Ordering::SeqCst;
-    /// use std::thread;
-    /// use std::time::Duration;
-    ///
-    /// fn spin_wait(ready: &AtomicBool) {
-    ///     let backoff = Backoff::new();
-    ///     while !ready.load(SeqCst) {
-    ///         backoff.snooze();
-    ///     }
-    /// }
-    ///
-    /// let ready = Arc::new(AtomicBool::new(false));
-    /// let ready2 = ready.clone();
-    ///
-    /// thread::spawn(move || {
-    ///     thread::sleep(Duration::from_millis(100));
-    ///     ready2.store(true, SeqCst);
-    /// });
-    ///
-    /// assert_eq!(ready.load(SeqCst), false);
-    /// spin_wait(&ready);
-    /// assert_eq!(ready.load(SeqCst), true);
-    /// # std::thread::sleep(std::time::Duration::from_millis(500)); // wait for background threads closed: https://github.com/rust-lang/miri/issues/1371
-    /// ```
-    ///
-    /// [`AtomicBool`]: std::sync::atomic::AtomicBool
     #[inline]
     pub fn snooze(&self) {
         if self.step.get() <= self.spin_limit {
-            for _ in 0..(1 << self.step.get()).min(self.nthreads.saturating_mul(16)) {
-                hint::spin_loop();
-            }
+            hint::spin_loop();
         } else {
             ::std::thread::yield_now();
         }
@@ -226,48 +109,6 @@ impl Backoff {
         }
     }
 
-    /// Returns `true` if exponential backoff has completed and blocking the thread is advised.
-    ///
-    /// # Examples
-    ///
-    /// Waiting for an [`AtomicBool`] to become `true` and parking the thread after a long wait:
-    ///
-    /// ```
-    /// use crossbeam_utils::Backoff;
-    /// use std::sync::Arc;
-    /// use std::sync::atomic::AtomicBool;
-    /// use std::sync::atomic::Ordering::SeqCst;
-    /// use std::thread;
-    /// use std::time::Duration;
-    ///
-    /// fn blocking_wait(ready: &AtomicBool) {
-    ///     let backoff = Backoff::new();
-    ///     while !ready.load(SeqCst) {
-    ///         if backoff.is_completed() {
-    ///             thread::park();
-    ///         } else {
-    ///             backoff.snooze();
-    ///         }
-    ///     }
-    /// }
-    ///
-    /// let ready = Arc::new(AtomicBool::new(false));
-    /// let ready2 = ready.clone();
-    /// let waiter = thread::current();
-    ///
-    /// thread::spawn(move || {
-    ///     thread::sleep(Duration::from_millis(100));
-    ///     ready2.store(true, SeqCst);
-    ///     waiter.unpark();
-    /// });
-    ///
-    /// assert_eq!(ready.load(SeqCst), false);
-    /// blocking_wait(&ready);
-    /// assert_eq!(ready.load(SeqCst), true);
-    /// # std::thread::sleep(std::time::Duration::from_millis(500)); // wait for background threads closed: https://github.com/rust-lang/miri/issues/1371
-    /// ```
-    ///
-    /// [`AtomicBool`]: std::sync::atomic::AtomicBool
     #[inline]
     pub fn is_completed(&self) -> bool {
         self.step.get() > self.yield_limit
@@ -340,7 +181,7 @@ pub fn best_limit_bench(nthreads: usize, min_time: std::time::Duration) -> (Spin
 
     let mut best = 0;
     let mut time = std::time::Duration::from_nanos(u64::MAX);
-    for limit in (spin_limit.0..40).step_by(2) {
+    for limit in (spin_limit.0..25).step_by(2) {
         let now = std::time::Instant::now();
         work(n_iters, spin_limit, YieldLimit(limit));
 

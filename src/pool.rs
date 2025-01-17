@@ -7,13 +7,12 @@ use std::{
     ptr::null_mut,
     sync::{
         atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     thread::{Builder, JoinHandle, Thread},
 };
 
-use crate::backoff::Backoff;
-use crossbeam::utils::CachePadded;
+use crossbeam::utils::{Backoff, CachePadded};
 
 struct FnDataCommon {
     f: *const (),
@@ -26,7 +25,7 @@ struct FnDataPerWorkerInner {
     parent: Option<Thread>,
     return_slot: *mut (),
     tid: usize,
-    batch: *mut [Worker],
+    batch: *mut [*mut Worker],
 }
 
 struct FnDataPerWorker(UnsafeCell<FnDataPerWorkerInner>);
@@ -64,8 +63,8 @@ pub struct ThreadPool {
 }
 
 #[repr(transparent)]
-pub struct ThreadGroup {
-    workers: [Worker],
+pub struct ThreadGroup<'a> {
+    workers: Mutex<Vec<&'a mut Worker>>,
 }
 
 impl Drop for ThreadPool {
@@ -106,7 +105,7 @@ impl ThreadPool {
                     job_data: job_data.clone(),
                     worker_data: worker_data.clone(),
                     handle: builder(tid).spawn(move || {
-                        let backoff = Backoff::new(6, 10, nthreads as u32);
+                        let backoff = Backoff::new();
                         loop {
                             if dropped.load(Ordering::Relaxed) {
                                 break;
@@ -170,18 +169,63 @@ impl ThreadPool {
         1 + self.workers.len()
     }
 
-    pub fn all(&mut self) -> &mut ThreadGroup {
-        ThreadGroup::from_mut(&mut self.workers)
+    pub fn all(&mut self) -> ThreadGroup<'_> {
+        ThreadGroup {
+            workers: Mutex::new(self.workers.iter_mut().collect()),
+        }
     }
 }
 
-impl ThreadGroup {
-    fn from_mut(workers: &mut [Worker]) -> &mut Self {
-        unsafe { &mut *(workers as *mut _ as *mut ThreadGroup) }
+impl<'a> ThreadGroup<'a> {
+    fn from_mut(workers: &mut [*mut Worker]) -> Self {
+        Self {
+            workers: Mutex::new(workers.iter_mut().map(|x| unsafe { &mut **x }).collect()),
+        }
     }
 
     pub fn num_threads(&self) -> usize {
-        1 + self.workers.len()
+        1 + self.workers.lock().unwrap().len()
+    }
+
+    pub fn with_pool<R>(&self, max_len: usize, f: impl FnOnce(&mut ThreadGroup) -> R) -> R {
+        let mut workers = Vec::with_capacity(max_len);
+
+        {
+            let mut mine = self.workers.lock().unwrap();
+            let mine = &mut *mine;
+            for _ in 1..max_len {
+                if let Some(w) = mine.pop() {
+                    workers.push(w);
+                }
+            }
+        }
+
+        struct Restore<'a, 'b> {
+            dst: &'b ThreadGroup<'a>,
+            src: ThreadGroup<'a>,
+        }
+
+        impl Drop for Restore<'_, '_> {
+            fn drop(&mut self) {
+                let mut dst = self.dst.workers.lock().unwrap();
+                for t in core::mem::take(self.src.workers.get_mut().unwrap()) {
+                    dst.push(t);
+                }
+            }
+        }
+
+        let mut restore = Restore {
+            dst: self,
+            src: ThreadGroup {
+                workers: Mutex::new(workers),
+            },
+        };
+
+        let ret = f(&mut restore.src);
+
+        drop(restore);
+
+        ret
     }
 
     fn fork_imp<R: Send, F: Sync + Fn(usize, &mut ThreadGroup) -> R>(
@@ -224,7 +268,10 @@ impl ThreadGroup {
         let uninit = v.as_mut_ptr() as *mut MaybeUninit<R>;
 
         let workers = &mut self.workers;
-        let (batch, mut workers) = workers.split_at_mut(group_sizes.next().unwrap() - 1);
+        let (batch, mut workers) = workers
+            .get_mut()
+            .unwrap()
+            .split_at_mut(group_sizes.next().unwrap() - 1);
 
         let mut panic_storage = MaybeUninit::<Box<dyn Any + Send>>::uninit();
 
@@ -252,7 +299,7 @@ impl ThreadGroup {
                 let inner = &mut *leader.worker_data.0.get();
                 inner.tid = k;
                 inner.return_slot = uninit.add(k) as *mut ();
-                inner.batch = batch;
+                inner.batch = batch as *mut [&mut Worker] as *mut [*mut Worker];
                 inner.subgroup_size = if subgroup + 1 == waits.len() {
                     if n_groups % subgroup_size == 0 {
                         subgroup_size
@@ -270,7 +317,7 @@ impl ThreadGroup {
                         (*(per_worker.return_slot as *mut MaybeUninit<R>)).write((*(data.f
                             as *const F))(
                             per_worker.tid,
-                            ThreadGroup::from_mut(&mut *(per_worker.batch)),
+                            &mut ThreadGroup::from_mut(&mut *(per_worker.batch)),
                         ));
                     }) {
                         Ok(()) => (),
@@ -291,11 +338,11 @@ impl ThreadGroup {
 
             let f = Unwind(f);
             let uninit = uninit as *mut ();
-            let batch = batch as *mut _;
+            let batch = batch as *mut [&mut Worker] as *mut [*mut Worker];
 
             match std::panic::catch_unwind(|| {
                 (*(uninit as *mut MaybeUninit<R>))
-                    .write(({ f }.0)(0, ThreadGroup::from_mut(&mut *batch)));
+                    .write(({ f }.0)(0, &mut ThreadGroup::from_mut(&mut *batch)));
             }) {
                 Ok(()) => (),
                 Err(panic_load) => {
@@ -311,7 +358,7 @@ impl ThreadGroup {
             }
         }
 
-        let backoff = Backoff::new(6, 10, self.num_threads() as u32);
+        let backoff = Backoff::new();
         loop {
             if data.jobs_left.load(Ordering::Acquire) == 0 {
                 break;
@@ -325,7 +372,7 @@ impl ThreadGroup {
         }
 
         if data.panic_slot.load(Ordering::Relaxed).is_null() {
-            std::panic::panic_any(unsafe { panic_storage.assume_init() });
+            std::panic::resume_unwind(unsafe { panic_storage.assume_init() });
         }
 
         unsafe { v.set_len(n_groups) };
@@ -344,8 +391,8 @@ impl ThreadGroup {
     pub fn fork2<RA: Send, RB: Send>(
         &mut self,
         group_sizes: &[usize; 2],
-        op_a: impl Sync + FnOnce(&mut ThreadGroup) -> RA,
-        op_b: impl Sync + FnOnce(&mut ThreadGroup) -> RB,
+        op_a: impl Send + FnOnce(&mut ThreadGroup) -> RA,
+        op_b: impl Send + FnOnce(&mut ThreadGroup) -> RB,
     ) -> (RA, RB) {
         enum Either<T, U> {
             Left(T),
@@ -372,6 +419,48 @@ impl ThreadGroup {
         };
 
         (ra, rb)
+    }
+
+    pub fn fork3<RA: Send, RB: Send, RC: Send>(
+        &mut self,
+        group_sizes: &[usize; 3],
+        op_a: impl Send + FnOnce(&mut ThreadGroup) -> RA,
+        op_b: impl Send + FnOnce(&mut ThreadGroup) -> RB,
+        op_c: impl Send + FnOnce(&mut ThreadGroup) -> RC,
+    ) -> (RA, RB, RC) {
+        enum Either<T, U, V> {
+            Left(T),
+            Mid(U),
+            Right(V),
+        }
+
+        let op_a = AssumeMtSafe(UnsafeCell::new(Some(op_a)));
+        let op_b = AssumeMtSafe(UnsafeCell::new(Some(op_b)));
+        let op_c = AssumeMtSafe(UnsafeCell::new(Some(op_c)));
+
+        let mut ret = self.fork_imp(group_sizes.iter().cloned(), &|tid, group| {
+            if tid == 0 {
+                let op_a = unsafe { (*{ &op_a }.0.get()).take().unwrap() };
+                Either::Left(op_a(group))
+            } else if tid == 1 {
+                let op_b = unsafe { (*{ &op_b }.0.get()).take().unwrap() };
+                Either::Mid(op_b(group))
+            } else {
+                let op_c = unsafe { (*{ &op_c }.0.get()).take().unwrap() };
+                Either::Right(op_c(group))
+            }
+        });
+        let Some(Either::Right(rc)) = ret.pop() else {
+            panic!()
+        };
+        let Some(Either::Mid(rb)) = ret.pop() else {
+            panic!()
+        };
+        let Some(Either::Left(ra)) = ret.pop() else {
+            panic!()
+        };
+
+        (ra, rb, rc)
     }
 
     pub fn broadcast<R: Send>(&mut self, f: impl Sync + Fn(usize) -> R) -> Vec<R> {
@@ -413,14 +502,14 @@ mod tests {
         });
     }
 
-    // #[test]
-    // #[should_panic]
-    // fn test_pool_panic() {
-    //     let nthreads = 12;
-    //     let mut pool = ThreadPool::new(nthreads, |_| Builder::new()).unwrap();
+    #[test]
+    #[should_panic]
+    fn test_pool_panic() {
+        let nthreads = 12;
+        let mut pool = ThreadPool::new(nthreads, |_| Builder::new()).unwrap();
 
-    //     pool.all().broadcast(|_| {
-    //         panic!();
-    //     });
-    // }
+        pool.all().broadcast(|_| {
+            panic!();
+        });
+    }
 }

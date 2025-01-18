@@ -5,7 +5,7 @@ use std::{
     ptr,
     sync::{
         atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering},
-        Arc,
+        Arc, RwLock,
     },
     thread::{Builder, JoinHandle},
 };
@@ -21,7 +21,6 @@ pub struct Task {
     job_fn: fn(*const (), usize),
     job_data: *const (),
     job_count: usize,
-    // idx: CachePadded<AtomicUsize>,
     n_done: CachePadded<AtomicUsize>,
     n_observers: CachePadded<AtomicUsize>,
     done: AtomicU32,
@@ -35,11 +34,12 @@ unsafe impl Send for Task {}
 pub struct Node {
     pub task: Task,
     pub next: AtomicPtr<Node>,
+    pub prev: AtomicPtr<Node>,
 }
 
 #[derive(Debug)]
 pub struct List {
-    pub lock: AtomicBool,
+    pub lock: RwLock<()>,
     pub head: AtomicPtr<Node>,
 }
 
@@ -47,49 +47,49 @@ impl List {
     pub const fn new() -> Self {
         Self {
             head: AtomicPtr::new(ptr::null_mut()),
-            lock: AtomicBool::new(false),
+            lock: RwLock::new(()),
         }
     }
 
     pub unsafe fn push(&self, node: *const Node) {
-        loop {
-            if self
-                .lock
-                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                let head = self.head.load(Ordering::Relaxed);
-                unsafe {
-                    (*node).next.store(head, Ordering::Relaxed);
-                }
-                self.head.store(node as *mut Node, Ordering::Relaxed);
+        let node = node as *mut Node;
 
-                self.lock.store(false, Ordering::Release);
-                return;
-            }
+        let __lock__ = self.lock.write().unwrap();
+
+        let head = self.head.load(Ordering::Relaxed);
+        (*node).next.store(head, Ordering::Relaxed);
+
+        if !head.is_null() {
+            (*head).prev.store(node, Ordering::Relaxed);
         }
+        self.head.store(node, Ordering::Relaxed);
     }
 
-    pub unsafe fn pop(&self) -> *const Node {
-        loop {
-            if self.head.load(Ordering::Relaxed).is_null() {
-                return ptr::null();
-            }
+    pub unsafe fn peek(&self) -> *const Node {
+        if self.head.load(Ordering::Relaxed).is_null() {
+            return ptr::null();
+        }
+        let __lock__ = self.lock.read().unwrap();
 
-            if self
-                .lock
-                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                let head = self.head.load(Ordering::Relaxed);
-                if !head.is_null() {
-                    let next = unsafe { (*head).next.load(Ordering::Relaxed) };
-                    self.head.store(next, Ordering::Relaxed);
-                };
+        let head = self.head.load(Ordering::Relaxed);
+        if !head.is_null() {
+            (*head).task.n_observers.fetch_add(1, Ordering::Relaxed);
+        };
+        head
+    }
 
-                self.lock.store(false, Ordering::Release);
-                return head;
-            }
+    pub unsafe fn remove(&self, node: *const Node) {
+        let __lock__ = self.lock.write().unwrap();
+
+        let next = (*node).next.load(Ordering::Relaxed);
+        let prev = (*node).prev.load(Ordering::Relaxed);
+        if !next.is_null() {
+            (*next).prev.store(prev, Ordering::Relaxed);
+        }
+        if !prev.is_null() {
+            (*prev).next.store(next, Ordering::Relaxed);
+        } else {
+            (self.head).store(ptr::null_mut(), Ordering::Relaxed);
         }
     }
 }
@@ -205,15 +205,15 @@ impl ThreadPool {
                         }
                     },
                     job_data: (&raw const job) as *const (),
-                    // idx: AtomicUsize::new(0).into(),
                     job_count,
                     n_done: AtomicUsize::new(0).into(),
-                    n_observers: AtomicUsize::new(1).into(),
+                    n_observers: AtomicUsize::new(0).into(),
                     done: AtomicU32::new(0),
 
                     started: started.as_ptr(),
                 },
                 next: AtomicPtr::new(ptr::null_mut()),
+                prev: AtomicPtr::new(ptr::null_mut()),
             };
 
             self.tasks.push(node);
@@ -226,46 +226,19 @@ impl ThreadPool {
             let done_ptr = &raw const task.done;
             let started = task.started;
 
-            let mut idx = tid % job_count;
-            'main: loop {
-                if node.task.done.load(Ordering::Acquire) != 0 {
-                    break 'main;
-                }
-                let started = core::slice::from_raw_parts(started, job_count.div_ceil(32));
+            main_loop(
+                started,
+                job_count,
+                tid % job_count,
+                f,
+                data,
+                n_done,
+                done_ptr,
+            );
 
-                let pos = idx / 32;
-                let shift = idx % 32;
-                if (started[pos].fetch_or(1 << shift, Ordering::AcqRel) >> shift) & 1 == 1 {
-                    let div = job_count / 32;
-                    let rem = job_count % 32;
-                    for (i, started) in started[..div].iter().enumerate() {
-                        let started = started.load(Ordering::Relaxed);
-                        if started != u32::MAX {
-                            idx = i * 32 + started.trailing_ones() as usize;
-                            continue 'main;
-                        }
-                    }
-                    if rem != 0 {
-                        let started = started[div].load(Ordering::Relaxed);
-                        if started != (1 << rem) - 1 {
-                            idx = div * 32 + started.trailing_ones() as usize;
-                            continue 'main;
-                        }
-                    }
-                    break 'main;
-                } else {
-                    f(data, idx);
-                    let n_done = n_done.fetch_add(1, Ordering::Release);
-
-                    if n_done + 1 == job_count {
-                        (*done_ptr).store(1, Ordering::Release);
-                        break 'main;
-                    }
-                }
-            }
+            self.tasks.remove(node);
 
             let backoff = Backoff::new(10, 20);
-
             while node.task.n_observers.load(Ordering::Acquire) > 0 {
                 if backoff.is_completed() {
                     atomic_wait::wait(&node.task.done, 0);
@@ -288,6 +261,53 @@ impl ThreadPool {
     }
 }
 
+unsafe fn main_loop(
+    started: *const AtomicU32,
+    job_count: usize,
+    mut idx: usize,
+    f: fn(*const (), usize),
+    data: *const (),
+    n_done: &CachePadded<AtomicUsize>,
+    done_ptr: *const AtomicU32,
+) {
+    'main: loop {
+        if (*done_ptr).load(Ordering::Acquire) != 0 {
+            break 'main;
+        }
+        let started = core::slice::from_raw_parts(started, job_count.div_ceil(32));
+
+        let pos = idx / 32;
+        let shift = idx % 32;
+        if (started[pos].fetch_or(1 << shift, Ordering::AcqRel) >> shift) & 1 == 1 {
+            let div = job_count / 32;
+            let rem = job_count % 32;
+            for (i, started) in started[..div].iter().enumerate() {
+                let started = started.load(Ordering::Relaxed);
+                if started != u32::MAX {
+                    idx = i * 32 + started.trailing_ones() as usize;
+                    continue 'main;
+                }
+            }
+            if rem != 0 {
+                let started = started[div].load(Ordering::Relaxed);
+                if started != (1 << rem) - 1 {
+                    idx = div * 32 + started.trailing_ones() as usize;
+                    continue 'main;
+                }
+            }
+            break 'main;
+        } else {
+            f(data, idx);
+            let n_done = n_done.fetch_add(1, Ordering::Release);
+
+            if n_done + 1 == job_count {
+                (*done_ptr).store(1, Ordering::Release);
+                break 'main;
+            }
+        }
+    }
+}
+
 fn run(
     tid: usize,
     dropped: Arc<AtomicBool>,
@@ -302,7 +322,7 @@ fn run(
             }
 
             unsafe {
-                let node = tasks.pop();
+                let node = tasks.peek();
 
                 if !node.is_null() {
                     let task = &(*node).task;
@@ -313,46 +333,16 @@ fn run(
                     let done_ptr = &raw const task.done;
                     let started = task.started;
 
-                    let mut idx = tid % job_count;
+                    main_loop(
+                        started,
+                        job_count,
+                        tid % job_count,
+                        f,
+                        data,
+                        n_done,
+                        done_ptr,
+                    );
 
-                    if (*done_ptr).load(Ordering::Acquire) == 0 {
-                        task.n_observers.fetch_add(1, Ordering::Relaxed);
-                        tasks.push(node);
-                    }
-
-                    'main: loop {
-                        let started = core::slice::from_raw_parts(started, job_count.div_ceil(32));
-
-                        let pos = idx / 32;
-                        let shift = idx % 32;
-                        if (started[pos].fetch_or(1 << shift, Ordering::AcqRel) >> shift) & 1 == 1 {
-                            let div = job_count / 32;
-                            let rem = job_count % 32;
-                            for (i, started) in started[..div].iter().enumerate() {
-                                let started = started.load(Ordering::Relaxed);
-                                if started != u32::MAX {
-                                    idx = i * 32 + started.trailing_ones() as usize;
-                                    continue 'main;
-                                }
-                            }
-                            if rem != 0 {
-                                let started = started[div].load(Ordering::Relaxed);
-                                if started != (1 << rem) - 1 {
-                                    idx = div * 32 + started.trailing_ones() as usize;
-                                    continue 'main;
-                                }
-                            }
-                            break 'main;
-                        } else {
-                            f(data, idx);
-                            let n_done = n_done.fetch_add(1, Ordering::Release);
-
-                            if n_done + 1 == job_count {
-                                (*done_ptr).store(1, Ordering::Release);
-                                break 'main;
-                            }
-                        }
-                    }
                     if task.n_observers.fetch_sub(1, Ordering::Release) - 1 == 0 {
                         atomic_wait::wake_one(done_ptr);
                     }

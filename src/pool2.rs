@@ -110,6 +110,7 @@ impl<T> UnwindSafe for Unwind<T> {}
 
 impl Drop for ThreadPool {
     fn drop(&mut self) {
+        self.has_work.store(1, Ordering::Release);
         self.dropped.store(true, Ordering::Release);
         atomic_wait::wake_all(&*self.has_work);
 
@@ -296,7 +297,7 @@ fn run(
     move || {
         let backoff = crossbeam::utils::Backoff::new();
         loop {
-            if dropped.load(Ordering::Relaxed) {
+            if dropped.load(Ordering::Acquire) {
                 break;
             }
 

@@ -137,7 +137,7 @@ pub fn scope<R>(n_jobs: usize, f: impl FnOnce(&mut Scope) -> R) -> R {
 	};
 
 	rayon::in_place_scope(|thd_scope| {
-		for _ in 0..n_jobs - 1 {
+		for _ in 0..Ord::min(rayon::current_num_threads(), n_jobs) - 1 {
 			thd_scope.spawn(move |_| unsafe {
 				let mut barrier = init.follower();
 

@@ -44,15 +44,14 @@ fn par_rayon(bencher: Bencher, (m, n): (usize, usize)) {
 
 fn par_scope(bencher: Bencher, (m, n): (usize, usize)) {
 	let mat = &mut *avec![0.0; m * n];
-	let n_threads = rayon::current_num_threads();
+	let n_jobs = rayon::current_num_threads() * 2;
 
 	bencher.bench(|| {
 		mat.fill(0.0);
 
-		syncthreads::scope(n_threads, |scope| {
+		syncthreads::scope(n_jobs, |scope| {
 			for _ in 0..n {
-				assert_eq!(n % n_threads, 0);
-				scope.for_each(mat.chunks_exact_mut(m * n / n_threads).collect(), |_, cols| {
+				scope.for_each(mat.chunks_exact_mut(m * n / n_jobs).collect(), |_, cols| {
 					for col in cols.chunks_exact_mut(m) {
 						for e in col {
 							*e += 1.0;
@@ -98,6 +97,8 @@ fn par_sync_free(bencher: Bencher, (m, n): (usize, usize)) {
 }
 
 fn main() -> std::io::Result<()> {
+	assert_eq!(256 % (2 * rayon::current_num_threads()), 0);
+
 	let mut bench = Bench::new(BenchConfig::from_args()?);
 	bench.register_many(
 		list![seq, par_scope, par_rayon, par_sync_free],

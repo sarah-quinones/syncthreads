@@ -121,6 +121,8 @@ fn par_sync_free(bencher: Bencher, (m, n): (usize, usize)) {
 }
 
 fn main() -> std::io::Result<()> {
+	dbg!(rayon::current_num_threads(), num_cpus::get_physical());
+
 	let n = 256usize.next_multiple_of(rayon::current_num_threads() * 8);
 
 	let mut bench = Bench::new(BenchConfig::from_args()?);

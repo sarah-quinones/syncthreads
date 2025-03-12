@@ -4,7 +4,7 @@ use std::ptr::null_mut;
 use std::sync::atomic::Ordering::*;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize};
 
-pub const SPIN_LIMIT: AtomicU32 = AtomicU32::new(1u32 << 20);
+pub const SPIN_LIMIT: AtomicU32 = AtomicU32::new(1u32 << 10);
 
 mod barrier;
 
@@ -176,7 +176,9 @@ pub fn scope<R>(n_jobs: usize, f: impl FnOnce(&mut Scope) -> R) -> R {
 					} else {
 						if spin < SPIN_LIMIT.load(Relaxed) {
 							spin += 1;
-							core::hint::spin_loop();
+							for _ in 0..32 {
+								core::hint::spin_loop();
+							}
 						} else {
 							spin = 0;
 							atomic_wait::wait(&waker, 0);

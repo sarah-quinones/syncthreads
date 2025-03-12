@@ -101,7 +101,9 @@ impl Barrier<'_> {
 
 				if spin < SPIN_LIMIT.load(Relaxed) {
 					spin += 1;
-					core::hint::spin_loop();
+					for _ in 0..32 {
+						core::hint::spin_loop();
+					}
 				} else {
 					atomic_wait::wait(&self.init.data, data);
 				}

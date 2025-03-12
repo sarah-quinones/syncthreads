@@ -92,6 +92,7 @@ impl Barrier<'_> {
 			atomic_wait::wake_all(&self.init.data);
 		} else {
 			let mut spin = 0u32;
+			let mut spin_count = 1u32;
 			loop {
 				let data = self.init.data.load(Acquire);
 
@@ -100,10 +101,12 @@ impl Barrier<'_> {
 				}
 
 				if spin < SPIN_LIMIT.load(Relaxed) {
-					spin += 1;
-					for _ in 0..32 {
+					for _ in 0..spin_count {
 						core::hint::spin_loop();
 					}
+					spin += 1;
+					spin_count *= 2;
+					spin_count = Ord::min(spin_count, 256);
 				} else {
 					atomic_wait::wait(&self.init.data, data);
 				}

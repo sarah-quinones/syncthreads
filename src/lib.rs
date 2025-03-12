@@ -4,7 +4,7 @@ use std::ptr::null_mut;
 use std::sync::atomic::Ordering::*;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize};
 
-pub const SPIN_LIMIT: AtomicU32 = AtomicU32::new(1u32 << 10);
+pub const SPIN_LIMIT: AtomicU32 = AtomicU32::new(32);
 
 mod barrier;
 
@@ -143,6 +143,7 @@ pub fn scope<R>(n_jobs: usize, f: impl FnOnce(&mut Scope) -> R) -> R {
 
 				let tid = barrier.thread_id();
 				let mut spin = 0;
+				let mut spin_count = 1u32;
 				loop {
 					if done.load(Acquire) {
 						break;
@@ -151,6 +152,8 @@ pub fn scope<R>(n_jobs: usize, f: impl FnOnce(&mut Scope) -> R) -> R {
 					let f_data = func_data.load(Acquire);
 					if !f_data.is_null() {
 						spin = 0;
+						spin_count = 1;
+
 						let f = (*func.0.get()).unwrap();
 						let sizeof = sizeof.load(Relaxed);
 						let base = data.load(Relaxed);
@@ -175,12 +178,13 @@ pub fn scope<R>(n_jobs: usize, f: impl FnOnce(&mut Scope) -> R) -> R {
 						barrier.wait_and_null(func_data);
 					} else {
 						if spin < SPIN_LIMIT.load(Relaxed) {
-							spin += 1;
-							for _ in 0..32 {
+							for _ in 0..spin_count {
 								core::hint::spin_loop();
 							}
+							spin += 1;
+							spin_count *= 2;
+							spin_count = Ord::min(spin_count, 256);
 						} else {
-							spin = 0;
 							atomic_wait::wait(&waker, 0);
 						}
 					}
@@ -269,7 +273,6 @@ fn std_scope<R>(n_jobs: usize, f: impl FnOnce(&mut Scope) -> R) -> R {
 							spin += 1;
 							core::hint::spin_loop();
 						} else {
-							spin = 0;
 							atomic_wait::wait(&waker, 0);
 						}
 					}

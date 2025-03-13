@@ -193,6 +193,7 @@ pub fn scope<R>(n_jobs: usize, f: impl FnOnce(&mut Scope) -> R) -> R {
 		}
 
 		let __guard__ = DropFn(|| {
+			waker.store(1, Relaxed);
 			done.store(true, Release);
 			atomic_wait::wake_all(waker);
 		});
@@ -281,6 +282,7 @@ fn std_scope<R>(n_jobs: usize, f: impl FnOnce(&mut Scope) -> R) -> R {
 		}
 
 		let __guard__ = DropFn(|| {
+			waker.store(1, Relaxed);
 			done.store(true, Release);
 			atomic_wait::wake_all(waker);
 		});

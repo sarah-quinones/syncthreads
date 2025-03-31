@@ -1,8 +1,11 @@
 use super::SPIN_LIMIT;
+use crate::PAUSE_PER_SPIN;
+
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering::*;
 use std::ptr::null_mut;
-use std::sync::atomic::AtomicPtr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicPtr};
 
 #[derive(Debug)]
 pub struct BarrierInit {
@@ -10,34 +13,29 @@ pub struct BarrierInit {
 	/// - `0..15`: count
 	/// - `16..31`: max
 	/// - `31`: global sense
+	pub(crate) thread_ids: Box<[AtomicU32]>,
+
 	pub(crate) data: AtomicU32,
-	pub(crate) arrived: AtomicU32,
-	pub(crate) __thread_count__: AtomicU32,
 }
 
 #[derive(Debug)]
-pub struct Barrier<'a> {
-	pub(crate) init: &'a BarrierInit,
+pub struct Barrier {
+	pub(crate) init: Arc<BarrierInit>,
 	thread_id: u32,
-	local_sense: bool,
+	local_sense: AtomicBool,
 }
 
-const MASK: u32 = (1u32 << 15) - 1;
+pub const MASK: u32 = (1u32 << 15) - 1;
 
 impl BarrierInit {
-	pub fn new() -> Self {
-		Self {
-			data: AtomicU32::new(1u32 | (1u32 << 16)),
-			arrived: AtomicU32::new(0),
-			__thread_count__: AtomicU32::new(1),
+	pub fn new(max_threads: usize) -> Self {
+		if max_threads > MASK as usize {
+			panic!("maximum supported limit of 32767 threads exceeded");
 		}
-	}
 
-	pub fn leader(&self) -> Barrier<'_> {
-		Barrier {
-			init: self,
-			thread_id: 0,
-			local_sense: false,
+		Self {
+			thread_ids: (0..max_threads as u32).map(AtomicU32::new).collect(),
+			data: AtomicU32::new(0),
 		}
 	}
 
@@ -45,68 +43,88 @@ impl BarrierInit {
 		((self.data.load(Relaxed) >> 16) & MASK) as usize
 	}
 
-	pub fn follower(&self) -> Barrier<'_> {
-		if self.__thread_count__.fetch_add(1, Relaxed) == MASK {
-			panic!("maximum supported limit of 32767 threads exceeded");
-		}
-
+	pub fn barrier(self: Arc<Self>) -> Option<Barrier> {
 		loop {
 			let data = self.data.load(Acquire);
-			if data & MASK == 0 {
+			let max = (data >> 16) & MASK;
+			if max == self.thread_ids.len() as u32 {
+				return None;
+			}
+
+			if data & MASK == 0 && max > 0 {
 				continue;
 			}
 
 			if self
 				.data
-				.compare_exchange_weak(data, data + (1u32 | (1u32 << 16)), AcqRel, Relaxed)
+				.compare_exchange_weak(data, data + (1u32 | (1u32 << 16)), Release, Relaxed)
 				.is_ok()
 			{
-				let max = (data >> 16) & MASK;
-				return Barrier {
-					init: self,
-					thread_id: max,
-					local_sense: (data >> 31) & 1 != 0,
-				};
-			};
+				loop {
+					for id in &self.thread_ids {
+						let v = id.load(Relaxed);
+						if v != u32::MAX && id.compare_exchange(v, u32::MAX, Relaxed, Relaxed).is_ok() {
+							return Some(Barrier {
+								init: self,
+								thread_id: v,
+								local_sense: AtomicBool::new((data >> 31) & 1 != 0),
+							});
+						}
+					}
+				}
+			}
 
 			core::hint::spin_loop();
 		}
 	}
 }
 
-impl Barrier<'_> {
+impl Barrier {
 	#[inline(never)]
-	pub fn wait_and_null(&mut self, ptr: &AtomicPtr<()>) {
-		self.local_sense = !self.local_sense;
-		let data = self.init.data.fetch_sub(1, AcqRel);
+	pub fn wait_and_null(&self, ptr: &AtomicPtr<()>, exit: bool) {
+		let local_sense = !self.local_sense.load(Relaxed);
+		self.local_sense.store(local_sense, Relaxed);
+		if exit {
+			'give_id: loop {
+				for id in &self.init.thread_ids {
+					let v = id.load(Relaxed);
+					if v == u32::MAX && id.compare_exchange(v, self.thread_id, Relaxed, Relaxed).is_ok() {
+						break 'give_id;
+					}
+				}
+			}
+		}
 
+		let data = self.init.data.fetch_sub(if exit { 1 | (1 << 16) } else { 1 }, AcqRel);
 		let count = data & MASK;
+		assert!(count > 0);
 
 		if count == 1 {
-			let max = (data >> 16) & MASK;
+			let mut max = (data >> 16) & MASK;
+			if exit {
+				max -= 1;
+			}
 
-			self.init.arrived.store(max, Relaxed);
 			ptr.store(null_mut(), Relaxed);
 
-			self.init.data.store((data + max - 1) ^ (1u32 << 31), Release);
+			self.init.data.store((max | (max << 16)) | ((local_sense as u32) << 31), Release);
 			atomic_wait::wake_all(&self.init.data);
-		} else {
+		} else if !exit {
 			let mut spin = 0u32;
-			let mut spin_count = 1u32;
+			let max_spin = PAUSE_PER_SPIN.load(Relaxed);
+			let limit = SPIN_LIMIT.load(Relaxed) / max_spin;
 			loop {
 				let data = self.init.data.load(Acquire);
 
-				if (data >> 31 != 0) == self.local_sense {
+				if data >> 31 == local_sense as u32 {
 					break;
 				}
 
-				if spin < SPIN_LIMIT.load(Relaxed) {
-					for _ in 0..spin_count {
+				if spin < limit {
+					for _ in 0..max_spin {
 						core::hint::spin_loop();
 					}
 					spin += 1;
-					spin_count *= 2;
-					spin_count = Ord::min(spin_count, 256);
 				} else {
 					atomic_wait::wait(&self.init.data, data);
 				}

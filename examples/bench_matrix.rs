@@ -14,7 +14,6 @@ fn seq(bencher: Bencher, (m, n): (usize, usize)) {
 
 	bencher.bench(|| {
 		A.fill(0.0);
-		B.fill(0.0);
 		for _ in 0..n {
 			for col in A.chunks_exact_mut(m) {
 				for e in col {
@@ -22,6 +21,7 @@ fn seq(bencher: Bencher, (m, n): (usize, usize)) {
 				}
 			}
 		}
+		B.fill(0.0);
 		for _ in 0..n {
 			for col in B.chunks_exact_mut(m) {
 				for e in col {
@@ -33,6 +33,9 @@ fn seq(bencher: Bencher, (m, n): (usize, usize)) {
 		for e in &*A {
 			assert_eq!(*e, n as f64);
 		}
+		for e in &*B {
+			assert_eq!(*e, n as f64);
+		}
 	});
 }
 
@@ -41,10 +44,8 @@ fn par_rayon(bencher: Bencher, (m, n): (usize, usize)) {
 	let B = &mut *avec![0.0; m * n];
 
 	bencher.bench(|| {
-		A.fill(0.0);
-		B.fill(0.0);
-
 		[&mut *A, &mut *B].into_par_iter().for_each(|A| {
+			A.fill(0.0);
 			for _ in 0..n {
 				A.par_chunks_exact_mut(m).for_each(|col| {
 					for e in &mut *col {
@@ -52,11 +53,10 @@ fn par_rayon(bencher: Bencher, (m, n): (usize, usize)) {
 					}
 				})
 			}
+			for e in &*A {
+				assert_eq!(*e, n as f64);
+			}
 		});
-
-		for e in &*A {
-			assert_eq!(*e, n as f64);
-		}
 	});
 }
 
@@ -66,10 +66,8 @@ fn par_scope_coarse(bencher: Bencher, (m, n): (usize, usize)) {
 	let n_jobs = rayon::current_num_threads();
 
 	bencher.bench(|| {
-		A.fill(0.0);
-		B.fill(0.0);
-
 		[&mut *A, &mut *B].into_par_iter().for_each(|A| {
+			A.fill(0.0);
 			syncthreads::with_lock(n_jobs, || {
 				for _ in 0..n {
 					syncthreads::for_each(n_jobs / 2, A.par_chunks_exact_mut(m * n / n_jobs), |cols| {
@@ -81,11 +79,10 @@ fn par_scope_coarse(bencher: Bencher, (m, n): (usize, usize)) {
 					});
 				}
 			});
+			for e in &*A {
+				assert_eq!(*e, n as f64);
+			}
 		});
-
-		for e in &*A {
-			assert_eq!(*e, n as f64);
-		}
 	});
 }
 
@@ -95,10 +92,8 @@ fn par_scope_fine(bencher: Bencher, (m, n): (usize, usize)) {
 	let n_jobs = rayon::current_num_threads() * 8;
 
 	bencher.bench(|| {
-		A.fill(0.0);
-		B.fill(0.0);
-
 		[&mut *A, &mut *B].into_par_iter().for_each(|A| {
+			A.fill(0.0);
 			syncthreads::with_lock(n_jobs, || {
 				for _ in 0..n {
 					syncthreads::for_each(n_jobs / 2, A.par_chunks_exact_mut(m * n / n_jobs), |cols| {
@@ -110,11 +105,10 @@ fn par_scope_fine(bencher: Bencher, (m, n): (usize, usize)) {
 					});
 				}
 			});
+			for e in &*A {
+				assert_eq!(*e, n as f64);
+			}
 		});
-
-		for e in &*A {
-			assert_eq!(*e, n as f64);
-		}
 	});
 }
 
@@ -123,27 +117,28 @@ fn par_scope_fine_recursive(bencher: Bencher, (m, n): (usize, usize)) {
 	let B = &mut *avec![0.0; m * n];
 	let n_jobs = rayon::current_num_threads() * 8;
 
-	bencher.bench(|| {
-		A.fill(0.0);
-		B.fill(0.0);
+	let bencher = syncthreads::UnsafeSync(bencher);
 
-		syncthreads::with_lock(n_jobs, || {
+	syncthreads::with_lock(rayon::current_num_threads(), || {
+		{ bencher }.0.bench(|| {
 			syncthreads::for_each(2, [&mut *A, &mut *B].into_par_iter(), |A| {
-				for _ in 0..n {
-					syncthreads::for_each(n_jobs / 2, A.par_chunks_exact_mut(m * n / n_jobs), |cols| {
-						for col in cols.chunks_exact_mut(m) {
-							for e in col {
-								*e += 1.0;
+				A.fill(0.0);
+				syncthreads::with_lock(rayon::current_num_threads(), || {
+					for _ in 0..n {
+						syncthreads::for_each(n_jobs, A.par_chunks_exact_mut(m * n / n_jobs), |cols| {
+							for col in cols.chunks_exact_mut(m) {
+								for e in col {
+									*e += 1.0;
+								}
 							}
-						}
-					});
+						});
+					}
+				});
+				for e in &*A {
+					assert_eq!(*e, n as f64);
 				}
 			});
 		});
-
-		for e in &*A {
-			assert_eq!(*e, n as f64);
-		}
 	});
 }
 

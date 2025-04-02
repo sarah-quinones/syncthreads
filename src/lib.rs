@@ -2,13 +2,14 @@
 
 use std::any::Any;
 use std::cell::{Cell, UnsafeCell};
+use std::hint::black_box;
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::*;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize};
 
 use aarc::AtomicArc;
-use barrier::BarrierInit;
+use barrier::{BarrierInit, Exit};
 use crossbeam::utils::CachePadded;
 use rayon::iter::plumbing::{Producer, ProducerCallback};
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
@@ -45,7 +46,6 @@ struct Node {
 	team_size: AtomicUsize,
 	panic_slot: AtomicPtr<Box<dyn Any + Send>>,
 
-	// exclusive
 	barrier: UnsafeCell<barrier::Barrier>,
 }
 
@@ -77,10 +77,14 @@ unsafe impl Sync for Node {}
 
 struct Scope<'a, 'b> {
 	n_threads: usize,
-	waker: &'a AtomicU32,
+	waker: AtomicU32,
 	spawn: &'a (dyn Sync + Fn(&Scope, ThdScope)),
 	n_spawn: &'a AtomicUsize,
 	rayon: Option<ThdScope<'a, 'b>>,
+	node: Node,
+	children: Box<[(AtomicUsize, AtomicArc<Scope<'static, 'static>>)]>,
+	children_thread_request: AtomicUsize,
+	done: AtomicBool,
 }
 
 thread_local! {
@@ -89,44 +93,188 @@ thread_local! {
 	static ROOT: Cell<*const Scope<'static, 'static>> = const { Cell::new(null_mut()) };
 }
 
+pub fn current_num_threads() -> usize {
+	if ROOT.get().is_null() {
+		rayon::current_num_threads()
+	} else {
+		unsafe { (*ROOT.get()).node.init.current_nthreads() }
+	}
+}
+
+pub fn current_thread_index() -> usize {
+	if ROOT.get().is_null() {
+		rayon::current_thread_index().unwrap_or(0)
+	} else {
+		unsafe {
+			if SELF.get().is_null() {
+				(*(*PARENT.get()).barrier.get()).thread_id()
+			} else {
+				(*(*SELF.get()).barrier.get()).thread_id()
+			}
+		}
+	}
+}
+
 pub fn with_lock<R: Send>(max_threads: usize, f: impl Send + FnOnce() -> R) -> R {
 	assert_ne!(max_threads, 0);
 
 	#[cfg(not(miri))]
 	let n_threads = rayon::current_num_threads();
 	#[cfg(miri)]
-	let n_threads = 4;
+	let n_threads = usize::MAX;
 
 	let n_threads = Ord::min(n_threads, max_threads);
 	let init = Arc::new(barrier::BarrierInit::new(n_threads));
 
-	let done = &AtomicBool::new(false);
-	let waker = &AtomicU32::new(0);
+	let done = AtomicBool::new(false);
+	let waker = AtomicU32::new(0);
 	let n_spawn = &AtomicUsize::new(1);
 
-	let node = &Node::new(init.clone(), null());
+	let node = Node::new(init.clone(), null());
+	let children_thread_request = AtomicUsize::new(0);
 
-	let scope = Scope {
+	let top_level = ROOT.get().is_null();
+
+	let mut scope = Scope {
+		done,
 		waker,
 		spawn: &|scope, _: ThdScope| unsafe {
-			ROOT.set(&raw const *scope as _);
-			PARENT.set(&raw const *node as _);
-			SELF.set(null_mut());
+			worker_loop(scope, top_level);
+		},
+		n_threads,
+		n_spawn,
+		rayon: None,
+		node,
+		children: std::iter::repeat_with(|| (AtomicUsize::new(usize::MAX), AtomicArc::new(None)))
+			.take(n_threads)
+			.collect::<Box<[_]>>(),
+		children_thread_request,
+	};
+	let spawn = scope.spawn;
+
+	if ROOT.get().is_null() {
+		#[cfg(not(miri))]
+		use rayon::scope as __scope__;
+		#[cfg(miri)]
+		use std::thread::scope as __scope__;
+
+		__scope__(|rayon_scope| {
+			scope.rayon = Some(unsafe { core::mem::transmute(rayon_scope) });
+
+			for _ in 1..n_threads {
+				scope.n_spawn.fetch_add(1, Relaxed);
+				#[cfg(not(miri))]
+				rayon_scope.spawn(|s| spawn(&scope, s));
+				#[cfg(miri)]
+				rayon_scope.spawn(|| spawn(&scope, rayon_scope));
+			}
+
+			let this = SELF.replace(&raw const scope.node as _);
+			let root = ROOT.replace(&raw const scope as _);
+
 			let __guard__ = Defer(|| {
-				PARENT.set(null_mut());
-				ROOT.set(null_mut());
+				scope.waker.store(1, Release);
+				scope.done.store(true, Release);
+				atomic_wait::wake_all(&scope.waker);
+				SELF.set(this);
+				ROOT.set(root);
 			});
 
-			let node = node;
-			let barrier = init.clone().barrier().unwrap();
+			f()
+		})
+	} else {
+		unsafe {
+			let root = &*ROOT.get();
+			scope.rayon = core::mem::transmute(root.rayon);
+			scope.n_spawn = root.n_spawn;
+			scope.spawn = root.spawn;
+			let scope = aarc::Arc::<Scope>::new(core::mem::transmute(scope));
+
+			let root = &*ROOT.replace(&raw const *scope as _);
+			let this = SELF.replace(&raw const scope.node as _);
+			let parent = PARENT.replace(null_mut());
+
+			let idx;
+			let waker;
+
+			root.children_thread_request.fetch_add(n_threads - 1, Release);
+			waker = root.waker.fetch_or(1, Release);
+			atomic_wait::wake_all(&root.waker);
+			'register: loop {
+				for (i, p) in root.children.iter().enumerate() {
+					if p.0.load(Relaxed) == usize::MAX {
+						if p.0.compare_exchange(usize::MAX, n_threads - 1, AcqRel, Relaxed).is_ok() {
+							idx = i;
+							p.1.store(Some(&scope));
+
+							break 'register;
+						}
+					}
+				}
+			}
+
+			let __guard__ = Defer(|| {
+				PARENT.set(parent);
+				ROOT.set(root);
+				SELF.set(this);
+
+				root.waker.store(waker, Release);
+				scope.waker.store(1, Release);
+				scope.done.store(true, Release);
+				atomic_wait::wake_all(&scope.waker);
+
+				root.children[idx].1.store(None::<&aarc::Arc<Scope>>);
+				let empty_seats = root.children[idx].0.swap(usize::MAX, AcqRel);
+				root.children_thread_request.fetch_sub(empty_seats, Release);
+
+				(*scope.node.barrier.get()).wait_and_null(&AtomicPtr::new(null_mut()), Exit::Late);
+			});
+
+			f()
+		}
+	}
+}
+
+unsafe fn worker_loop(scope: &Scope<'_, '_>, top_level: bool) {
+	let node = &scope.node;
+	let children_thread_request = &scope.children_thread_request;
+	let waker = &scope.waker;
+	let init = &scope.node.init;
+	let n_spawn = &scope.n_spawn;
+	let done = &scope.done;
+
+	unsafe {
+		let root = ROOT.replace(&raw const *scope as _);
+		let parent = PARENT.replace(&raw const scope.node as _);
+		let this = SELF.replace(null_mut());
+		let __guard__ = Defer(|| {
+			PARENT.set(parent);
+			ROOT.set(root);
+			SELF.set(this);
+		});
+		let node = node;
+
+		if scope.done.load(Acquire) {
+			if top_level {
+				n_spawn.fetch_sub(1, Relaxed);
+			}
+			return;
+		}
+		let barrier = 'search_loop: loop {
+			let barrier = match init.clone().barrier() {
+				Some(b) => b,
+				None => panic!(),
+			};
 
 			let tid = barrier.thread_id();
+
 			let mut spin = 0;
 			let max_spin = PAUSE_PER_SPIN.load(Relaxed);
 			let limit = SPIN_LIMIT.load(Relaxed) / max_spin;
-			loop {
+
+			'work_loop: loop {
 				if done.load(Acquire) {
-					break;
+					break 'search_loop barrier;
 				}
 
 				let f_data = node.func_data.load(Acquire);
@@ -134,55 +282,59 @@ pub fn with_lock<R: Send>(max_threads: usize, f: impl Send + FnOnce() -> R) -> R
 					spin = 0;
 
 					thd_work(tid, node, None, false);
-					barrier.wait_and_null(&node.func_data, false);
+
+					if barrier.wait_and_null(&node.func_data, Exit::WhenPositive(children_thread_request)) {
+						break 'work_loop;
+					}
 				} else {
-					if spin < limit {
-						for _ in 0..max_spin {
-							core::hint::spin_loop();
+					if children_thread_request.load(Acquire) > 0 {
+						barrier.wait_and_null(&node.func_data, Exit::Early);
+						break 'work_loop;
+					}
+
+					{
+						if spin < limit {
+							for _ in 0..max_spin {
+								core::hint::spin_loop();
+							}
+							spin += 1;
+						} else {
+							atomic_wait::wait(&waker, 0);
 						}
-						spin += 1;
-					} else {
-						atomic_wait::wait(&waker, 0);
 					}
 				}
 			}
 
+			for (idx, child) in scope.children.iter().enumerate() {
+				_ = idx;
+				let mut child_jobs = child.0.load(Acquire);
+				while child_jobs != usize::MAX && child_jobs > 0 {
+					match child.0.compare_exchange(child_jobs, child_jobs - 1, AcqRel, Acquire) {
+						Ok(_) => {
+							if children_thread_request.fetch_sub(1, Release) == 0 {
+								panic!();
+							}
+							loop {
+								if let Some(child) = child.1.load() {
+									worker_loop(&*child, false);
+									continue 'search_loop;
+								}
+								if child.0.load(Acquire) == usize::MAX {
+									break;
+								}
+							}
+						},
+						Err(new) => child_jobs = new,
+					}
+				}
+			}
+		};
+		if top_level {
 			n_spawn.fetch_sub(1, Relaxed);
-		},
-		n_threads,
-		n_spawn,
-		rayon: None,
-	};
-	let spawn = scope.spawn;
-
-	#[cfg(not(miri))]
-	use rayon::scope as __scope__;
-	#[cfg(miri)]
-	use std::thread::scope as __scope__;
-
-	let mut scope = scope;
-	__scope__(|rayon_scope| {
-		scope.rayon = Some(unsafe { core::mem::transmute(rayon_scope) });
-
-		for _ in 1..n_threads {
-			n_spawn.fetch_add(1, Relaxed);
-			#[cfg(not(miri))]
-			rayon_scope.spawn(|s| spawn(&scope, s));
-			#[cfg(miri)]
-			rayon_scope.spawn(|| spawn(&scope, rayon_scope));
+		} else {
+			barrier.wait_and_null(&AtomicPtr::new(null_mut()), Exit::Early);
 		}
-
-		SELF.set(&raw const *node as _);
-		ROOT.set(&raw const scope as _);
-
-		let __guard__ = Defer(|| {
-			waker.store(1, Relaxed);
-			done.store(true, Release);
-			atomic_wait::wake_all(waker);
-		});
-
-		f()
-	})
+	}
 }
 
 fn for_each_raw_imp(n_jobs: usize, f: &(dyn Sync + Fn(usize))) {
@@ -220,12 +372,6 @@ fn for_each_raw_imp(n_jobs: usize, f: &(dyn Sync + Fn(usize))) {
 								p.1.store(Some(&node));
 								break 'register;
 							}
-							// let mut p_ = p.1.write().unwrap();
-							// if p_.is_none() {
-							// 	*p_ = Some(node);
-							// 	p.0.store(true, Relaxed);
-							// 	break 'register;
-							// }
 						}
 					}
 				}
@@ -243,8 +389,10 @@ fn for_each_raw_imp(n_jobs: usize, f: &(dyn Sync + Fn(usize))) {
 				let this = &*{ this };
 				#[cfg(not(miri))]
 				if let Some(rayon) = root.rayon {
-					for _ in root.n_spawn.load(Relaxed)..root.n_threads {
-						(root.spawn)(&*root, rayon);
+					if false {
+						for _ in root.n_spawn.load(Relaxed)..root.n_threads {
+							(root.spawn)(&*root, rayon);
+						}
 					}
 				}
 
@@ -277,11 +425,11 @@ fn for_each_raw_imp(n_jobs: usize, f: &(dyn Sync + Fn(usize))) {
 				root.waker.store(1, Relaxed);
 				let f_data = f as *const F as *mut ();
 				this.func_data.store(f_data, Release);
-				atomic_wait::wake_all(root.waker);
+				atomic_wait::wake_all(&root.waker);
 
 				thd_work((*this.barrier.get()).thread_id(), &this, Some(this), false);
 
-				(*this.barrier.get()).wait_and_null(&this.func_data, false);
+				(*this.barrier.get()).wait_and_null(&this.func_data, Exit::Late);
 				root.waker.store(0, Relaxed);
 
 				if this.panic_slot.load(Relaxed).is_null() {
@@ -334,16 +482,19 @@ fn for_each_imp<T, I: IndexedParallelIterator<Item = T>>(n_jobs: usize, iter: I,
 	iter.with_producer(C(f, len, n_jobs));
 }
 
-pub fn for_each<T, I: IndexedParallelIterator<Item = T>>(n_jobs: usize, iter: I, f: impl Sync + Fn(T)) {
-	for_each_imp(n_jobs, iter, &f);
+pub fn for_each<T, I: IntoParallelIterator<Iter: IndexedParallelIterator, Item = T>>(n_jobs: usize, iter: I, f: impl Sync + Fn(T)) {
+	for_each_imp(n_jobs, iter.into_par_iter(), &f);
 }
 
 pub fn for_each_raw(n_jobs: usize, f: impl Sync + Fn(usize)) {
 	for_each_raw_imp(n_jobs, (&f) as &(dyn Sync + Fn(usize)));
 }
 
-struct UnsafeSync<T>(T);
+#[doc(hidden)]
+#[derive(Copy, Clone, Debug)]
+pub struct UnsafeSync<T>(pub T);
 unsafe impl<T> Sync for UnsafeSync<T> {}
+unsafe impl<T> Send for UnsafeSync<T> {}
 
 unsafe fn thd_work(thd_id: usize, node: &Node, watch: Option<&Node>, called_from_parent: bool) {
 	unsafe {
@@ -370,7 +521,7 @@ unsafe fn thd_work(thd_id: usize, node: &Node, watch: Option<&Node>, called_from
 									} else {
 										thd_work(barrier.thread_id(), child, None, true);
 									}
-									barrier.wait_and_null(&child.func_data, true);
+									barrier.wait_and_null(&child.func_data, Exit::Early);
 
 									if arrived() {
 										return;
@@ -440,7 +591,7 @@ unsafe fn thd_work(thd_id: usize, node: &Node, watch: Option<&Node>, called_from
 				}
 			}
 		}
-		let mut rem = node.rem.load(Relaxed);
+		let mut rem = node.rem.load(Acquire);
 		while rem > 0 && rem != usize::MAX {
 			match node.rem.compare_exchange_weak(rem, rem - 1, Release, Acquire) {
 				Ok(_) => {
@@ -472,7 +623,7 @@ mod tests {
 	use rayon::prelude::*;
 
 	#[test]
-	fn test() {
+	fn test_nested_for_each() {
 		let m = 10;
 		let n = 16;
 
@@ -494,6 +645,56 @@ mod tests {
 
 		for e in &*A {
 			assert_eq!(*e, n as f64);
+		}
+	}
+
+	#[test]
+	fn test_nested_lock() {
+		let mut A = [1; 128];
+		with_lock(16, || {
+			with_lock(4, || {
+				for_each(4, &mut A, |x| {
+					*x = 0;
+				});
+			});
+		});
+		assert_eq!(A, [0; 128]);
+	}
+
+	#[test]
+	fn test_scope_recursive() {
+		let m = 16;
+		let n = 16;
+		let A = &mut *avec![0.0; m * n];
+		let B = &mut *avec![0.0; m * n];
+		let n_jobs = 16;
+
+		for _ in 0..4 {
+			with_lock(n_jobs, || {
+				A.fill(0.0);
+				B.fill(0.0);
+
+				for_each(2, [&mut *A, &mut *B].into_par_iter(), |A| {
+					with_lock(n_jobs, || {
+						for _ in 0..n {
+							for_each(n_jobs, A.par_chunks_mut(m * n / n_jobs), |cols| {
+								for col in cols.chunks_mut(m) {
+									for e in col {
+										*e += 1.0;
+									}
+								}
+							});
+						}
+					});
+				});
+
+				for e in &*A {
+					assert_eq!(*e, n as f64);
+				}
+				for e in &*B {
+					assert_eq!(*e, n as f64);
+				}
+			});
 		}
 	}
 }
